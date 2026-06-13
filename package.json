@@ -1,0 +1,53 @@
+{
+  "name": "@cloptima/llm-observability",
+  "version": "0.1.1",
+  "description": "LLM usage telemetry SDK for Cloptima reporting, attribution, and analytics",
+  "license": "SEE LICENSE IN LICENSE",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "homepage": "https://github.com/cloptima/cloptima-llm-observability-js#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloptima/cloptima-llm-observability-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cloptima/cloptima-llm-observability-js/issues"
+  },
+  "keywords": [
+    "cloptima",
+    "llm",
+    "ai",
+    "observability",
+    "telemetry",
+    "finops",
+    "openai",
+    "anthropic",
+    "gemini",
+    "otlp"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "examples",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json --outDir /tmp/cloptima-llm-observability-js-test-build && CLOPTIMA_LLM_OBSERVABILITY_TEST_BUILD=/tmp/cloptima-llm-observability-js-test-build node --test test/*.test.mjs && node test/install-smoke.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

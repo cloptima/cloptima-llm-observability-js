@@ -1,0 +1,207 @@
+[
+  {
+    "name": "openai_chat_completion_usage",
+    "provider": "openai",
+    "kind": "response",
+    "payload": {
+      "id": "chatcmpl-fixture-openai",
+      "model": "gpt-4.1-mini",
+      "usage": {
+        "prompt_tokens": 12,
+        "completion_tokens": 8,
+        "total_tokens": 20,
+        "prompt_tokens_details": {
+          "cached_tokens": 5
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 2
+        }
+      }
+    },
+    "expected": {
+      "provider": "openai",
+      "provider_request_id": "chatcmpl-fixture-openai",
+      "model": "gpt-4.1-mini",
+      "input_tokens": 12,
+      "output_tokens": 8,
+      "total_tokens": 20,
+      "reasoning_tokens": 2,
+      "cached_input_tokens": 5,
+      "cache_hit": true
+    }
+  },
+  {
+    "name": "openai_stream_final_usage",
+    "provider": "openai",
+    "kind": "stream",
+    "payload": [
+      { "id": "chatcmpl-fixture-openai-stream", "model": "gpt-4.1-mini", "choices": [{ "delta": { "content": "hello" } }] },
+      { "id": "chatcmpl-fixture-openai-stream", "model": "gpt-4.1-mini", "usage": { "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7 } }
+    ],
+    "expected": {
+      "provider": "openai",
+      "provider_request_id": "chatcmpl-fixture-openai-stream",
+      "model": "gpt-4.1-mini",
+      "input_tokens": 3,
+      "output_tokens": 4,
+      "total_tokens": 7
+    }
+  },
+  {
+    "name": "azure_openai_deployment_usage",
+    "provider": "azure_openai",
+    "kind": "response",
+    "payload": {
+      "id": "chatcmpl-fixture-azure",
+      "deployment_name": "gpt-4o-mini-prod",
+      "usage": {
+        "prompt_tokens": 9,
+        "completion_tokens": 6,
+        "total_tokens": 15
+      }
+    },
+    "expected": {
+      "provider": "azure_openai",
+      "provider_request_id": "chatcmpl-fixture-azure",
+      "model": "gpt-4o-mini-prod",
+      "input_tokens": 9,
+      "output_tokens": 6,
+      "total_tokens": 15
+    }
+  },
+  {
+    "name": "anthropic_message_usage",
+    "provider": "anthropic",
+    "kind": "response",
+    "payload": {
+      "id": "msg-fixture-anthropic",
+      "model": "claude-haiku-4-5",
+      "usage": {
+        "input_tokens": 14,
+        "output_tokens": 5,
+        "cache_read_input_tokens": 4,
+        "cache_creation_input_tokens": 3
+      }
+    },
+    "expected": {
+      "provider": "anthropic",
+      "provider_request_id": "msg-fixture-anthropic",
+      "model": "claude-haiku-4-5",
+      "input_tokens": 14,
+      "output_tokens": 5,
+      "total_tokens": 19,
+      "cached_input_tokens": 4,
+      "extra_usage_units": { "cache_write": 3 },
+      "cache_hit": true
+    }
+  },
+  {
+    "name": "anthropic_stream_incremental_usage",
+    "provider": "anthropic",
+    "kind": "stream",
+    "payload": [
+      {
+        "type": "message_start",
+        "message": {
+          "id": "msg-fixture-anthropic-stream",
+          "model": "claude-haiku-4-5",
+          "usage": { "input_tokens": 10, "cache_read_input_tokens": 2 }
+        }
+      },
+      { "type": "message_delta", "usage": { "output_tokens": 7, "cache_creation_input_tokens": 1 } }
+    ],
+    "expected": {
+      "provider": "anthropic",
+      "provider_request_id": "msg-fixture-anthropic-stream",
+      "model": "claude-haiku-4-5",
+      "input_tokens": 10,
+      "output_tokens": 7,
+      "total_tokens": 17,
+      "cached_input_tokens": 2,
+      "extra_usage_units": { "cache_write": 1 },
+      "cache_hit": true
+    }
+  },
+  {
+    "name": "gemini_usage_metadata",
+    "provider": "gemini",
+    "kind": "response",
+    "payload": {
+      "responseId": "gemini-fixture-response",
+      "modelVersion": "gemini-3.5-flash",
+      "usageMetadata": {
+        "promptTokenCount": 17,
+        "candidatesTokenCount": 9,
+        "totalTokenCount": 26,
+        "thoughtsTokenCount": 4,
+        "cachedContentTokenCount": 6
+      }
+    },
+    "expected": {
+      "provider": "gemini",
+      "provider_request_id": "gemini-fixture-response",
+      "model": "gemini-3.5-flash",
+      "input_tokens": 17,
+      "output_tokens": 9,
+      "total_tokens": 26,
+      "reasoning_tokens": 4,
+      "cached_input_tokens": 6,
+      "cache_hit": true
+    }
+  },
+  {
+    "name": "vertex_stream_usage_metadata",
+    "provider": "vertex_ai",
+    "kind": "stream",
+    "payload": [
+      { "response_id": "vertex-fixture-stream", "model_version": "gemini-3.5-flash" },
+      { "usage_metadata": { "prompt_token_count": 5, "candidates_token_count": 6, "total_token_count": 11 } }
+    ],
+    "expected": {
+      "provider": "vertex_ai",
+      "provider_request_id": "vertex-fixture-stream",
+      "model": "gemini-3.5-flash",
+      "input_tokens": 5,
+      "output_tokens": 6,
+      "total_tokens": 11
+    }
+  },
+  {
+    "name": "bedrock_response_usage",
+    "provider": "bedrock",
+    "kind": "response",
+    "payload": {
+      "modelId": "anthropic.claude-3-5-sonnet",
+      "usage": { "inputTokens": 20, "outputTokens": 6, "totalTokens": 26 },
+      "metrics": { "latencyMs": 321 },
+      "ResponseMetadata": { "RequestId": "bedrock-fixture-response" }
+    },
+    "expected": {
+      "provider": "bedrock",
+      "provider_request_id": "bedrock-fixture-response",
+      "model": "anthropic.claude-3-5-sonnet",
+      "input_tokens": 20,
+      "output_tokens": 6,
+      "total_tokens": 26,
+      "latency_ms": 321
+    }
+  },
+  {
+    "name": "bedrock_stream_delta_usage",
+    "provider": "bedrock",
+    "kind": "stream",
+    "payload": [
+      { "requestId": "bedrock-fixture-stream", "modelId": "anthropic.claude-3-5-sonnet", "usage": { "inputTokens": 5 } },
+      { "usage": { "outputTokens": 4 } },
+      { "usage": { "outputTokens": 3 } }
+    ],
+    "expected": {
+      "provider": "bedrock",
+      "provider_request_id": "bedrock-fixture-stream",
+      "model": "anthropic.claude-3-5-sonnet",
+      "input_tokens": 5,
+      "output_tokens": 7,
+      "total_tokens": 12
+    }
+  }
+]
