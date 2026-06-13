@@ -1,5 +1,8 @@
 export type CloptimaFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
-export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http' | 'dual';
+export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http';
+const INTERNAL_DUAL_DELIVERY_MODE = 'dual';
+const INTERNAL_DUAL_DELIVERY_MODE_ENABLED = false;
+type InternalLLMObservabilityDeliveryMode = LLMObservabilityDeliveryMode | typeof INTERNAL_DUAL_DELIVERY_MODE;
 
 export type LLMAttribution = {
   teamId?: string;
@@ -95,11 +98,10 @@ export type MetadataPrivacyOptions = {
 };
 
 export type CloptimaLLMClientOptions = {
-  ingestUrl: string;
+  apiBaseUrl?: string;
   apiKey: string;
   defaultAttribution: LLMAttribution;
   deliveryMode?: LLMObservabilityDeliveryMode;
-  otlpUrl?: string;
   otlpHeaders?: Record<string, string>;
   otlpServiceName?: string;
   otlpServiceVersion?: string;
@@ -251,15 +253,17 @@ export type PayloadValidationResult = {
 
 const SDK_EVENT_SCHEMA_VERSION = 'cloptima.llm.event.v1';
 const SDK_BATCH_SCHEMA_VERSION = 'cloptima.llm.batch.v1';
+const DEFAULT_API_BASE_URL = 'https://api.cloptima.ai';
+const SDK_INGEST_PATH = '/v1/ai/integrations/sdk/events';
+const OTLP_TRACES_PATH = '/v1/ai/integrations/otlp/traces';
 const INIT_ENV_PREFIX = 'CLOPTIMA_LLM_OBSERVABILITY_';
 const INIT_ENABLED_ENV = `${INIT_ENV_PREFIX}ENABLED`;
-const INIT_INGEST_URL_ENV = `${INIT_ENV_PREFIX}INGEST_URL`;
+const INIT_API_BASE_URL_ENV = `${INIT_ENV_PREFIX}API_BASE_URL`;
 const INIT_API_KEY_ENV = `${INIT_ENV_PREFIX}API_KEY`;
 const INIT_APP_ID_ENV = `${INIT_ENV_PREFIX}APP_ID`;
 const INIT_ENVIRONMENT_ENV = `${INIT_ENV_PREFIX}ENVIRONMENT`;
 const INIT_TEAM_ID_ENV = `${INIT_ENV_PREFIX}TEAM_ID`;
 const INIT_DELIVERY_MODE_ENV = `${INIT_ENV_PREFIX}DELIVERY_MODE`;
-const INIT_OTLP_URL_ENV = `${INIT_ENV_PREFIX}OTLP_URL`;
 const INIT_OTLP_SERVICE_NAME_ENV = `${INIT_ENV_PREFIX}OTLP_SERVICE_NAME`;
 const INIT_OTLP_SERVICE_VERSION_ENV = `${INIT_ENV_PREFIX}OTLP_SERVICE_VERSION`;
 
@@ -689,16 +693,26 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function resolveDeliveryMode(mode?: string): LLMObservabilityDeliveryMode {
-  return mode === 'otlp_http' || mode === 'dual' ? mode : 'cloptima_http';
+function resolveDeliveryMode(mode?: string): InternalLLMObservabilityDeliveryMode {
+  if (mode === INTERNAL_DUAL_DELIVERY_MODE) {
+    if (!INTERNAL_DUAL_DELIVERY_MODE_ENABLED) {
+      throw new Error('deliveryMode "dual" is temporarily disabled');
+    }
+    return INTERNAL_DUAL_DELIVERY_MODE;
+  }
+  return mode === 'otlp_http' ? mode : 'cloptima_http';
 }
 
-function resolveOtlpUrl(ingestUrl: string, otlpUrl?: string): string {
-  const explicit = cleanString(otlpUrl);
-  if (explicit) {
-    return explicit;
-  }
-  return ingestUrl.replace(/\/sdk\/events\/?$/, '/otlp/traces');
+function resolveApiBaseUrl(apiBaseUrl?: string): string {
+  return (cleanString(apiBaseUrl) || DEFAULT_API_BASE_URL).replace(/\/+$/, '');
+}
+
+function resolveIngestUrl(apiBaseUrl: string): string {
+  return `${resolveApiBaseUrl(apiBaseUrl)}${SDK_INGEST_PATH}`;
+}
+
+function resolveOtlpUrl(apiBaseUrl: string): string {
+  return `${resolveApiBaseUrl(apiBaseUrl)}${OTLP_TRACES_PATH}`;
 }
 
 function shouldAttachDefaultOtlpAuthorization(otlpUrl: string): boolean {
@@ -1084,9 +1098,11 @@ function fetchProviderRequestId(headers: Headers, explicitHeader?: string): stri
 }
 
 export class CloptimaLLMObservability implements LLMObservabilityClient {
+  private readonly options: CloptimaLLMClientOptions & { apiBaseUrl: string };
   private readonly fetchImpl: CloptimaFetch;
   private readonly sdkName: string;
-  private readonly deliveryMode: LLMObservabilityDeliveryMode;
+  private readonly deliveryMode: InternalLLMObservabilityDeliveryMode;
+  private readonly ingestUrl: string;
   private readonly otlpUrl: string;
   private readonly otlpHeaders: Record<string, string>;
   private readonly otlpServiceName: string;
@@ -1107,21 +1123,26 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
   private deliveredEvents = 0;
   private failedBatches = 0;
 
-  constructor(private readonly options: CloptimaLLMClientOptions) {
-    this.fetchImpl = requireFetch(options.fetchImpl);
-    this.sdkName = options.sdkName || '@cloptima/llm-observability';
-    this.deliveryMode = resolveDeliveryMode(options.deliveryMode);
-    this.otlpUrl = resolveOtlpUrl(options.ingestUrl, options.otlpUrl);
-    this.otlpHeaders = options.otlpHeaders || {};
-    this.otlpServiceName = options.otlpServiceName || 'cloptima-llm-observability';
-    this.otlpServiceVersion = options.otlpServiceVersion;
-    this.asyncQueueMaxSize = Math.max(1, Math.trunc(options.asyncQueueMaxSize ?? 1000));
-    this.asyncBatchSize = Math.max(1, Math.trunc(options.asyncBatchSize ?? 20));
-    this.asyncFlushIntervalMs = Math.max(0, Math.trunc(options.asyncFlushIntervalMs ?? 250));
-    this.asyncRetryCount = Math.max(0, Math.trunc(options.asyncRetryCount ?? 2));
-    this.asyncRetryBackoffMs = Math.max(0, Math.trunc(options.asyncRetryBackoffMs ?? 100));
-    this.asyncRetryJitterRatio = Math.max(0, Math.min(1, Number(options.asyncRetryJitterRatio ?? 0.2)));
-    this.metadataPrivacy = resolveMetadataPrivacyOptions(options.metadataPrivacy);
+  constructor(options: CloptimaLLMClientOptions) {
+    this.options = {
+      ...options,
+      apiBaseUrl: resolveApiBaseUrl(options.apiBaseUrl),
+    };
+    this.fetchImpl = requireFetch(this.options.fetchImpl);
+    this.sdkName = this.options.sdkName || '@cloptima/llm-observability';
+    this.deliveryMode = resolveDeliveryMode(this.options.deliveryMode);
+    this.ingestUrl = resolveIngestUrl(this.options.apiBaseUrl);
+    this.otlpUrl = resolveOtlpUrl(this.options.apiBaseUrl);
+    this.otlpHeaders = this.options.otlpHeaders || {};
+    this.otlpServiceName = this.options.otlpServiceName || 'cloptima-llm-observability';
+    this.otlpServiceVersion = this.options.otlpServiceVersion;
+    this.asyncQueueMaxSize = Math.max(1, Math.trunc(this.options.asyncQueueMaxSize ?? 1000));
+    this.asyncBatchSize = Math.max(1, Math.trunc(this.options.asyncBatchSize ?? 20));
+    this.asyncFlushIntervalMs = Math.max(0, Math.trunc(this.options.asyncFlushIntervalMs ?? 250));
+    this.asyncRetryCount = Math.max(0, Math.trunc(this.options.asyncRetryCount ?? 2));
+    this.asyncRetryBackoffMs = Math.max(0, Math.trunc(this.options.asyncRetryBackoffMs ?? 100));
+    this.asyncRetryJitterRatio = Math.max(0, Math.min(1, Number(this.options.asyncRetryJitterRatio ?? 0.2)));
+    this.metadataPrivacy = resolveMetadataPrivacyOptions(this.options.metadataPrivacy);
   }
 
   isEnabled(): boolean {
@@ -1163,10 +1184,10 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
   private async postPayload(payload: Record<string, unknown>): Promise<void> {
     const requestPayload = this.payloadWithEnvelopeMetadata(payload);
     let cloptimaError: unknown;
-    if (this.deliveryMode === 'cloptima_http' || this.deliveryMode === 'dual') {
+    if (this.deliveryMode === 'cloptima_http' || this.deliveryMode === INTERNAL_DUAL_DELIVERY_MODE) {
       try {
         await this.withRetries(async () => {
-          const response = await this.fetchImpl(this.options.ingestUrl, {
+          const response = await this.fetchImpl(this.ingestUrl, {
             method: 'POST',
             headers: {
               authorization: `Bearer ${this.options.apiKey}`,
@@ -1180,12 +1201,12 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
         });
       } catch (error) {
         cloptimaError = error;
-        if (this.deliveryMode === 'dual') {
+        if (this.deliveryMode === INTERNAL_DUAL_DELIVERY_MODE) {
           this.options.onError?.(error);
         }
       }
     }
-    if (this.deliveryMode === 'otlp_http' || this.deliveryMode === 'dual') {
+    if (this.deliveryMode === 'otlp_http' || this.deliveryMode === INTERNAL_DUAL_DELIVERY_MODE) {
       const otlpPayload = payloadToOtlpRequest(
         requestPayload,
         this.sdkName,
@@ -1636,7 +1657,7 @@ function resolvedInitAttribution(options: InitFromEnvOptions | undefined): Parti
     endCustomerId: cleanString(options?.defaultAttribution?.endCustomerId),
     tenantId: cleanString(options?.defaultAttribution?.tenantId),
     release: cleanString(options?.defaultAttribution?.release),
-    environment: cleanString(options?.defaultAttribution?.environment) || cleanString(env[INIT_ENVIRONMENT_ENV]),
+    environment: cleanString(options?.defaultAttribution?.environment) || cleanString(env[INIT_ENVIRONMENT_ENV]) || 'production',
     actorId: cleanString(options?.defaultAttribution?.actorId),
     actorType: cleanString(options?.defaultAttribution?.actorType) as LLMAttribution['actorType'] | undefined,
     developerId: cleanString(options?.defaultAttribution?.developerId),
@@ -1653,11 +1674,8 @@ export function isEnabled(options?: InitFromEnvOptions): boolean {
     return false;
   }
   const attribution = resolvedInitAttribution(options);
-  return Boolean(
-    cleanString(options?.ingestUrl) || cleanString(env[INIT_INGEST_URL_ENV]),
-  ) && Boolean(
-    cleanString(options?.apiKey) || cleanString(env[INIT_API_KEY_ENV]),
-  ) && Boolean(attribution.appId) && Boolean(attribution.environment);
+  return Boolean(cleanString(options?.apiKey) || cleanString(env[INIT_API_KEY_ENV]))
+    && Boolean(attribution.appId);
 }
 
 export function disabledClient(initErrorValue?: Error): DisabledCloptimaLLMObservability {
@@ -1673,15 +1691,13 @@ export function initFromEnv(
     return disabledClient();
   }
 
-  const ingestUrl = cleanString(options?.ingestUrl) || cleanString(env[INIT_INGEST_URL_ENV]);
+  const apiBaseUrl = cleanString(options?.apiBaseUrl) || cleanString(env[INIT_API_BASE_URL_ENV]) || DEFAULT_API_BASE_URL;
   const apiKey = cleanString(options?.apiKey) || cleanString(env[INIT_API_KEY_ENV]);
   const defaultAttribution = resolvedInitAttribution(options);
 
   const missingFields = [
-    !ingestUrl ? INIT_INGEST_URL_ENV : undefined,
     !apiKey ? INIT_API_KEY_ENV : undefined,
     !defaultAttribution.appId ? INIT_APP_ID_ENV : undefined,
-    !defaultAttribution.environment ? INIT_ENVIRONMENT_ENV : undefined,
   ].filter(Boolean);
 
   if (missingFields.length > 0) {
@@ -1702,11 +1718,10 @@ export function initFromEnv(
 
   return new CloptimaLLMObservability({
     ...clientOptions,
-    ingestUrl: ingestUrl || '',
+    apiBaseUrl: apiBaseUrl || '',
     apiKey: apiKey || '',
     defaultAttribution: defaultAttribution as LLMAttribution,
     deliveryMode: options?.deliveryMode || cleanString(env[INIT_DELIVERY_MODE_ENV]) as LLMObservabilityDeliveryMode | undefined,
-    otlpUrl: options?.otlpUrl || cleanString(env[INIT_OTLP_URL_ENV]),
     otlpServiceName: options?.otlpServiceName || cleanString(env[INIT_OTLP_SERVICE_NAME_ENV]),
     otlpServiceVersion: options?.otlpServiceVersion || cleanString(env[INIT_OTLP_SERVICE_VERSION_ENV]),
   });

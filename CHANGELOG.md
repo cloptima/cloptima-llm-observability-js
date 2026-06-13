@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Simplified setup so customers only configure Cloptima credentials and attribution, with one advanced domain override for non-production environments.
+- Clarified OTLP delivery as a supported way to send OpenTelemetry-compatible telemetry to Cloptima.
+- Added clearer examples and onboarding guidance for both standard SDK delivery and OTLP delivery to Cloptima.
+
 ## 0.1.0
 
 - Initial public beta release of the Cloptima JavaScript LLM observability SDK.

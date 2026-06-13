@@ -3,8 +3,12 @@ import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const buildDir = process.env.CLOPTIMA_LLM_OBSERVABILITY_TEST_BUILD || '/tmp/cloptima-llm-observability-js-test-build';
-const TEST_INGEST_URL = 'https://sdk-ingest.example.cloptima.ai/sdk/events';
-const TEST_OTLP_URL = 'https://sdk-ingest.example.cloptima.ai/otlp/traces';
+const DEFAULT_API_BASE_URL = 'https://api.cloptima.ai';
+const TEST_API_BASE_URL = 'https://sdk-ingest.example.cloptima.ai';
+const DEFAULT_INGEST_URL = `${DEFAULT_API_BASE_URL}/v1/ai/integrations/sdk/events`;
+const DEFAULT_OTLP_URL = `${DEFAULT_API_BASE_URL}/v1/ai/integrations/otlp/traces`;
+const TEST_INGEST_URL = `${TEST_API_BASE_URL}/v1/ai/integrations/sdk/events`;
+const TEST_OTLP_URL = `${TEST_API_BASE_URL}/v1/ai/integrations/otlp/traces`;
 const fixtureCandidates = [
   new URL('../../llm-observability-fixtures/provider_usage_replay.json', import.meta.url),
   new URL('../llm-observability-fixtures/provider_usage_replay.json', import.meta.url),
@@ -97,7 +101,7 @@ test('initFromEnv can build a configured client from env', async () => {
   let body;
   const client = initFromEnv({
     env: {
-      CLOPTIMA_LLM_OBSERVABILITY_INGEST_URL: TEST_INGEST_URL,
+      CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL: TEST_API_BASE_URL,
       CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
       CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
       CLOPTIMA_LLM_OBSERVABILITY_ENVIRONMENT: 'prod',
@@ -112,7 +116,7 @@ test('initFromEnv can build a configured client from env', async () => {
   assert.equal(client.isEnabled(), true);
   assert.equal(isEnabled({
     env: {
-      CLOPTIMA_LLM_OBSERVABILITY_INGEST_URL: TEST_INGEST_URL,
+      CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL: TEST_API_BASE_URL,
       CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
       CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
       CLOPTIMA_LLM_OBSERVABILITY_ENVIRONMENT: 'prod',
@@ -130,6 +134,94 @@ test('initFromEnv can build a configured client from env', async () => {
   assert.equal(body.metadata.team_id, 'platform');
 });
 
+test('initFromEnv uses default ingest URL and production environment when omitted', async () => {
+  let observedInput;
+  let body;
+  const client = initFromEnv({
+    env: {
+      CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
+      CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
+    },
+    fetchImpl: async (input, init) => {
+      observedInput = String(input);
+      body = JSON.parse(String(init?.body));
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  assert.equal(client.isEnabled(), true);
+  assert.equal(isEnabled({
+    env: {
+      CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
+      CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
+    },
+  }), true);
+
+  await client.record({
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+  });
+
+  assert.equal(observedInput, DEFAULT_INGEST_URL);
+  assert.equal(body.metadata.environment, 'production');
+});
+
+test('isEnabled requires api key and app id only', () => {
+  assert.equal(isEnabled({
+    env: {
+      CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
+    },
+  }), false);
+  assert.equal(isEnabled({
+    env: {
+      CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
+    },
+  }), false);
+  assert.equal(isEnabled({
+    env: {
+      CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
+      CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
+    },
+  }), true);
+});
+
+test('direct constructor derives the default OTLP URL from the default ingest URL', async () => {
+  const observed = [];
+  const client = new CloptimaLLMObservability({
+    apiKey: 'pat-env',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'production',
+    },
+    deliveryMode: 'otlp_http',
+    fetchImpl: async (input) => {
+      observed.push(String(input));
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  await client.record({
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+  });
+
+  assert.deepEqual(observed, [DEFAULT_OTLP_URL]);
+});
+
+test('direct constructor rejects the dormant dual delivery mode', () => {
+  assert.throws(
+    () => new CloptimaLLMObservability({
+      apiKey: 'pat-env',
+      defaultAttribution: {
+        appId: 'agent-api',
+        environment: 'production',
+      },
+      deliveryMode: 'dual',
+    }),
+    /temporarily disabled/,
+  );
+});
+
 test('initFromEnv stays fail-open but diagnosable when explicitly enabled and misconfigured', async () => {
   const errors = [];
   const client = initFromEnv({
@@ -143,6 +235,7 @@ test('initFromEnv stays fail-open but diagnosable when explicitly enabled and mi
   assert.equal(client.isEnabled(), false);
   assert.equal(errors.length, 1);
   assert.match(errors[0], /missing required configuration/i);
+  assert.match(errors[0], /API_KEY/i);
   assert.match(client.getInitError()?.message || '', /missing required configuration/i);
 });
 
@@ -182,7 +275,7 @@ test('disabledClient observeStreamCall passes through stream chunks without buff
 test('record posts canonical SDK telemetry to Cloptima ingest', async () => {
   let observed;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     sdkVersion: '0.1.0',
     defaultAttribution: {
@@ -247,7 +340,7 @@ test('record posts canonical SDK telemetry to Cloptima ingest', async () => {
 test('record derives source event ids from existing identifiers or generates one', async () => {
   const bodies = [];
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -279,7 +372,7 @@ test('record derives source event ids from existing identifiers or generates one
 test('recordBatch posts multiple events in one SDK ingest request', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -382,7 +475,7 @@ test('validatePayload reports malformed event and batch payloads', () => {
 test('record posts OTLP JSON spans when otlp delivery mode is enabled', async () => {
   let observed;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     sdkVersion: '0.1.0',
     deliveryMode: 'otlp_http',
@@ -437,13 +530,12 @@ test('record posts OTLP JSON spans when otlp delivery mode is enabled', async ()
   assert.equal(attrs.environment.stringValue, 'prod');
 });
 
-test('record does not leak Cloptima authorization headers to custom OTLP collectors by default', async () => {
+test('record does not leak Cloptima authorization headers to non-Cloptima OTLP hosts', async () => {
   let observed;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: 'http://127.0.0.1:4318',
     apiKey: 'pat-test',
     deliveryMode: 'otlp_http',
-    otlpUrl: 'http://127.0.0.1:4318/v1/traces',
     defaultAttribution: {
       appId: 'agent-api',
       environment: 'dev',
@@ -460,7 +552,7 @@ test('record does not leak Cloptima authorization headers to custom OTLP collect
     sourceEventId: 'event-otlp-local-1',
   });
 
-  assert.equal(observed?.input, 'http://127.0.0.1:4318/v1/traces');
+  assert.equal(observed?.input, 'http://127.0.0.1:4318/v1/ai/integrations/otlp/traces');
   assert.equal(observed?.init?.headers.authorization, undefined);
 });
 
@@ -468,7 +560,7 @@ test('record applies metadata privacy rules before ingest', async () => {
   let body;
   const drops = [];
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -510,7 +602,7 @@ test('record applies metadata privacy rules before ingest', async () => {
 test('record strict_finops mode keeps only finance-safe custom metadata keys', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -540,103 +632,17 @@ test('record strict_finops mode keeps only finance-safe custom metadata keys', a
   assert.equal(body.metadata.prompt, undefined);
 });
 
-test('record posts both canonical and OTLP payloads in dual delivery mode', async () => {
-  const observed = [];
-  const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
-    apiKey: 'pat-test',
-    deliveryMode: 'dual',
-    otlpHeaders: { 'x-otlp-token': 'edge-secret' },
-    defaultAttribution: {
-      appId: 'agent-api',
-      environment: 'dev',
-    },
-    fetchImpl: async (input, init) => {
-      observed.push({ input, init });
-      return new Response('{}', { status: 202 });
-    },
-  });
-
-  await client.record({
-    provider: 'anthropic',
-    model: 'claude-3-5-sonnet',
-    sourceEventId: 'event-dual-1',
-  });
-
-  assert.equal(observed.length, 2);
-  assert.equal(observed[0].input, TEST_INGEST_URL);
-  assert.equal(observed[1].input, TEST_OTLP_URL);
-  assert.equal(JSON.parse(String(observed[0].init.body)).source_event_id, 'event-dual-1');
-  assert.equal(observed[1].init.headers['x-otlp-token'], 'edge-secret');
-  const otlpBody = JSON.parse(String(observed[1].init.body));
-  assert.equal(otlpBody.resourceSpans[0].scopeSpans[0].spans[0].attributes.find((attribute) => attribute.key === 'source_event_id').value.stringValue, 'event-dual-1');
-});
-
-test('dual delivery keeps the Cloptima leg successful when the OTLP mirror fails', async () => {
-  const observed = [];
-  const errors = [];
-  const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
-    apiKey: 'pat-test',
-    deliveryMode: 'dual',
-    otlpUrl: 'http://127.0.0.1:4318/v1/traces',
-    asyncRetryCount: 0,
-    defaultAttribution: {
-      appId: 'agent-api',
-      environment: 'dev',
-    },
-    onError: (error) => errors.push(String(error)),
-    fetchImpl: async (input, init) => {
-      observed.push({ input, init });
-      if (String(input).includes('/v1/traces')) {
-        return new Response('{}', { status: 503 });
-      }
-      return new Response('{}', { status: 202 });
-    },
-  });
-
-  await client.record({
-    provider: 'openai',
-    model: 'gpt-4o-mini',
-    sourceEventId: 'event-dual-failover-1',
-  });
-
-  assert.equal(observed.length, 2);
-  assert.equal(errors.length, 1);
-  assert.match(errors[0], /OTLP ingest failed/);
-});
-
-test('dual delivery reports Cloptima leg failures through onError before throwing', async () => {
-  const observed = [];
-  const errors = [];
-  const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
-    apiKey: 'pat-test',
-    deliveryMode: 'dual',
-    otlpUrl: 'http://127.0.0.1:4318/v1/traces',
-    asyncRetryCount: 0,
-    onError: (error) => errors.push(String(error)),
-    fetchImpl: async (input, init) => {
-      observed.push({ input, init });
-      if (String(input).includes('/sdk/events')) {
-        return new Response('{}', { status: 503 });
-      }
-      return new Response('{}', { status: 202 });
-    },
-  });
-
-  await assert.rejects(
-    client.record({
-      provider: 'openai',
-      model: 'gpt-4o-mini',
-      sourceEventId: 'event-dual-cloptima-fail-1',
+test('initFromEnv rejects the dormant dual delivery mode', () => {
+  assert.throws(
+    () => initFromEnv({
+      env: {
+        CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
+        CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
+        CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE: 'dual',
+      },
     }),
-    /Cloptima LLM ingest failed/,
+    /temporarily disabled/,
   );
-
-  assert.equal(observed.length, 2);
-  assert.equal(errors.length, 1);
-  assert.match(errors[0], /Cloptima LLM ingest failed/);
 });
 
 test('recordAsync uses bounded queue, batches events, retries, and flushes', async () => {
@@ -644,7 +650,7 @@ test('recordAsync uses bounded queue, batches events, retries, and flushes', asy
   let calls = 0;
   const errors = [];
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -677,7 +683,7 @@ test('recordAsync uses bounded queue, batches events, retries, and flushes', asy
 
 test('recordAsync flush and close honor strict timeouts while transport is blocked', async () => {
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     asyncFlushIntervalMs: 0,
     fetchImpl: async () => new Promise(() => {}),
@@ -699,7 +705,7 @@ test('recordAsync reports queue overflow and closed client errors', async () => 
   const errors = [];
   const drops = [];
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -728,7 +734,7 @@ test('recordAsync reports queue overflow and closed client errors', async () => 
 test('observe records successful calls with extracted OpenAI usage', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -790,7 +796,7 @@ test('observe records successful calls with extracted OpenAI usage', async () =>
 test('observeCall accepts flat attribution fields and per-call metadata privacy overrides', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -840,7 +846,7 @@ test('observeCall accepts flat attribution fields and per-call metadata privacy 
 test('createInstrumentedFetch wraps fetch and records openai-compatible usage', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -889,7 +895,7 @@ test('createInstrumentedFetch fails open when provider resolution is missing', a
   let fetchCalls = 0;
   let recordCalls = 0;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -942,7 +948,7 @@ test('createInstrumentedFetch short-circuits entirely when the client is disable
 test('instrumentOpenAICompatibleResponse records an existing response without wrapping the provider client', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1000,7 +1006,7 @@ test('instrumentOpenAICompatibleResponse accepts a disabled client and returns t
 test('instrumentOpenAICompatibleResponse measures real latency when given the provider promise directly', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1039,7 +1045,7 @@ test('instrumentOpenAICompatibleResponse measures real latency when given the pr
 test('instrumentOpenAICompatibleResponse records failed provider promises', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1076,7 +1082,7 @@ test('instrumentOpenAICompatibleResponse records failed provider promises', asyn
 test('instrumentFetchLLMUsage records raw fetch responses without wrapping provider clients', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1124,7 +1130,7 @@ test('instrumentFetchLLMUsage records raw fetch responses without wrapping provi
 test('instrumentFetchLLMUsage measures latency from provider fetch promises', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1162,7 +1168,7 @@ test('instrumentFetchLLMUsage measures latency from provider fetch promises', as
 test('instrumentFetchLLMUsage records failed provider fetch promises', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1201,7 +1207,7 @@ test('createInstrumentedFetch reports malformed json responses through onInstrum
   const errors = [];
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1238,7 +1244,7 @@ test('createInstrumentedFetch reports malformed json responses through onInstrum
 test('observe records failed calls when requested synchronously', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1270,7 +1276,7 @@ test('observe records failed calls when requested synchronously', async () => {
 test('observeStream yields chunks and records final stream usage', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1313,7 +1319,7 @@ test('observeStream yields chunks and records final stream usage', async () => {
 test('instrumentOpenAICompatibleStream observes an existing stream and yields original chunks', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1402,7 +1408,7 @@ test('instrumentNextJsRouteContext extracts request metadata from Request object
 test('instrumentOpenAICompatibleStream preserves azure_openai provider attribution', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1439,7 +1445,7 @@ test('observeStream defaults to synchronous recording and bounds extractor chunk
   let body;
   const observedChunkLengths = [];
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',
@@ -1484,7 +1490,7 @@ test('observeStream defaults to synchronous recording and bounds extractor chunk
 test('observeStream records partial telemetry when stream fails after chunks', async () => {
   let body;
   const client = new CloptimaLLMObservability({
-    ingestUrl: TEST_INGEST_URL,
+    apiBaseUrl: TEST_API_BASE_URL,
     apiKey: 'pat-test',
     defaultAttribution: {
       appId: 'agent-api',

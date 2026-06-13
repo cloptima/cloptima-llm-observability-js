@@ -12,22 +12,22 @@ npm install @cloptima/llm-observability
 
 ## Configuration
 
-Required environment variables:
+Common environment variables:
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `CLOPTIMA_LLM_OBSERVABILITY_INGEST_URL` | Yes | HTTPS endpoint for SDK event ingestion |
 | `CLOPTIMA_LLM_OBSERVABILITY_API_KEY` | Yes | Cloptima API key for telemetry writes |
 | `CLOPTIMA_LLM_OBSERVABILITY_APP_ID` | Yes | Application or service identifier |
-| `CLOPTIMA_LLM_OBSERVABILITY_ENVIRONMENT` | Yes | Deployment environment such as `dev`, `staging`, or `prod` |
-| `CLOPTIMA_LLM_OBSERVABILITY_TEAM_ID` | No | Team or ownership group |
 | `CLOPTIMA_LLM_OBSERVABILITY_ENABLED` | No | Explicitly enable or disable the SDK |
-| `CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE` | No | `cloptima_http`, `otlp_http`, or `dual` |
-| `CLOPTIMA_LLM_OBSERVABILITY_OTLP_URL` | No | Custom OTLP endpoint |
-| `CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_NAME` | No | OTLP service name |
-| `CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_VERSION` | No | OTLP service version |
 
-The SDK sends bearer-authenticated HTTPS requests to the configured Cloptima ingest endpoint.
+Recommended optional environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `CLOPTIMA_LLM_OBSERVABILITY_ENVIRONMENT` | Deployment environment such as `dev`, `staging`, or `prod`. Defaults to `production`, so set this explicitly when testing outside production. |
+| `CLOPTIMA_LLM_OBSERVABILITY_TEAM_ID` | Team or ownership group |
+
+The SDK sends bearer-authenticated HTTPS requests to `https://api.cloptima.ai/v1/ai/integrations/sdk/events` by default.
 
 ## Quick start
 
@@ -102,17 +102,24 @@ const fetchWithUsage = createInstrumentedFetch(cloptima, {
 });
 ```
 
-This is useful for broad coverage, but it has less application context than `observeCall(...)`. Prefer the boundary helper when you already know the provider, model, and feature at the call site.
+This is useful for broad coverage, but it has less application context than `observeCall(...)`. Prefer `observeCall(...)` when you already know the provider, model, and feature at the call site.
 
 ## OTLP mode
 
-The SDK supports three delivery modes:
+The SDK supports two delivery modes:
 
 - `cloptima_http`
 - `otlp_http`
-- `dual`
 
-Use `otlp_http` or `dual` when you want OpenTelemetry-compatible output in addition to, or instead of, direct Cloptima delivery.
+Use `otlp_http` when you want the SDK to send OpenTelemetry-compatible payloads to Cloptima's OTLP-compatible receiver instead of the standard SDK telemetry endpoint.
+
+`otlp_http` is still a Cloptima delivery mode. The SDK keeps the OTLP route fixed and only lets you override the Cloptima API domain or environment.
+
+Advanced configuration:
+
+- `CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE` selects `cloptima_http` or `otlp_http`
+- `CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL` overrides the Cloptima API domain while the SDK keeps the ingest routes fixed
+- `CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_NAME` and `CLOPTIMA_LLM_OBSERVABILITY_OTLP_SERVICE_VERSION` customize OTLP service metadata
 
 ## Attribution fields
 
@@ -159,11 +166,12 @@ They return payload previews in memory and do not send network traffic.
 
 See the `examples/` directory for:
 
-- OpenAI boundary instrumentation
-- Anthropic boundary instrumentation
-- Gemini boundary instrumentation
-- custom wrapper instrumentation
-- fetch wrapper instrumentation
+- OpenAI call-site instrumentation
+- OpenTelemetry-compatible delivery to Cloptima
+- Anthropic call-site instrumentation
+- Gemini call-site instrumentation
+- custom wrapper integration
+- fetch wrapper integration
 
 ## Public API
 
@@ -194,9 +202,9 @@ Additional helper surface:
 
 No telemetry arrives:
 
-- verify `CLOPTIMA_LLM_OBSERVABILITY_INGEST_URL`
-- verify the API key is valid for SDK event ingestion
+- verify the API key is valid for Cloptima telemetry ingestion
 - check `client.isEnabled()`
+- if you use advanced routing overrides, verify `CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL` points at the intended Cloptima environment
 - inspect a sample event with `validatePayload(previewEventPayload(...))`
 
 Configuration behavior:

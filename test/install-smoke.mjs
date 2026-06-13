@@ -20,7 +20,6 @@ function run(command, args, options = {}) {
 }
 
 try {
-  const ingestUrl = 'https://sdk-ingest.example.cloptima.ai/sdk/events';
   const packageCopy = path.join(workDir, 'package');
   await mkdir(packageCopy);
   await copyFile(path.join(packageRoot, 'package.json'), path.join(packageCopy, 'package.json'));
@@ -70,7 +69,6 @@ try {
     import { initFromEnv } from '@cloptima/llm-observability';
     const client = initFromEnv({
       env: {
-        CLOPTIMA_LLM_OBSERVABILITY_INGEST_URL: '${ingestUrl}',
         CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-test',
         CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
         CLOPTIMA_LLM_OBSERVABILITY_ENVIRONMENT: 'dev',
