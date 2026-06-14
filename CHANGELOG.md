@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.4
+
+- Improved telemetry ingestion request headers to resolve potential network connectivity and compatibility issues in some network environments.
+
 ## 0.1.3
 
 - Added stronger public examples for existing wrapper integrations, context-based attribution, and OTLP-compatible delivery to Cloptima.

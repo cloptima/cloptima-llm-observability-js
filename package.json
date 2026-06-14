@@ -1,6 +1,6 @@
 {
   "name": "@cloptima/llm-observability",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "LLM usage telemetry SDK for Cloptima reporting, attribution, and analytics",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",

@@ -1,3 +1,4 @@
+const PACKAGE_VERSION = '0.1.4';
 export type CloptimaFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http';
 export type LLMUsageExtractor<T = unknown> = (input: T) => Partial<LLMUsageEvent>;
@@ -1635,6 +1636,18 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
     await this.postPayload({ schema_version: SDK_BATCH_SCHEMA_VERSION, events: payloads });
   }
 
+  private sdkUserAgent(): string {
+    return `${this.sdkName}/${this.options.sdkVersion ?? PACKAGE_VERSION}`;
+  }
+
+  private cloptimaRequestHeaders(): Record<string, string> {
+    return {
+      authorization: `Bearer ${this.options.apiKey}`,
+      'content-type': 'application/json',
+      'user-agent': this.sdkUserAgent(),
+    };
+  }
+
   private otlpRequestHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
       'content-type': 'application/json',
@@ -1643,6 +1656,10 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
     const hasExplicitAuthorization = Object.keys(headers).some((key) => key.toLowerCase() === 'authorization');
     if (!hasExplicitAuthorization && shouldAttachDefaultOtlpAuthorization(this.otlpUrl)) {
       headers.authorization = `Bearer ${this.options.apiKey}`;
+    }
+    const hasExplicitUserAgent = Object.keys(headers).some((key) => key.toLowerCase() === 'user-agent');
+    if (!hasExplicitUserAgent) {
+      headers['user-agent'] = this.sdkUserAgent();
     }
     return headers;
   }
@@ -1655,10 +1672,7 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
         await this.withRetries(async () => {
           const response = await this.fetchImpl(this.ingestUrl, {
             method: 'POST',
-            headers: {
-              authorization: `Bearer ${this.options.apiKey}`,
-              'content-type': 'application/json',
-            },
+            headers: this.cloptimaRequestHeaders(),
             body: JSON.stringify(requestPayload),
           });
           if (!response.ok) {

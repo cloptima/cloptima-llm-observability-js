@@ -338,6 +338,7 @@ test('record posts canonical SDK telemetry to Cloptima ingest', async () => {
   assert.equal(observed?.input, TEST_INGEST_URL);
   assert.equal(observed?.init?.method, 'POST');
   assert.equal(observed?.init?.headers.authorization, 'Bearer pat-test');
+  assert.equal(observed?.init?.headers['user-agent'], '@cloptima/llm-observability/0.1.0');
   const body = JSON.parse(String(observed?.init?.body));
   assert.equal(body.sdk_name, '@cloptima/llm-observability');
   assert.equal(body.sdk_version, '0.1.0');
@@ -530,6 +531,7 @@ test('record posts OTLP JSON spans when otlp delivery mode is enabled', async ()
   });
 
   assert.equal(observed?.input, TEST_OTLP_URL);
+  assert.equal(observed?.init?.headers['user-agent'], '@cloptima/llm-observability/0.1.0');
   const body = JSON.parse(String(observed?.init?.body));
   assert.equal(body.resourceSpans[0].resource.attributes[0].value.stringValue, 'checkout-api');
   assert.equal(body.resourceSpans[0].resource.attributes[1].value.stringValue, '2026.06.1');
