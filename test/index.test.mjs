@@ -20,6 +20,12 @@ if (!providerUsageReplayFixture) {
 const providerUsageReplayFixtures = JSON.parse(readFileSync(providerUsageReplayFixture, 'utf8'));
 const {
   CloptimaLLMObservability,
+  bindObservedCall,
+  bindObservedStream,
+  composeUsageExtractors,
+  createMappedUsageExtractor,
+  createObservedCall,
+  createObservedStream,
   createInstrumentedFetch,
   disabledClient,
   DisabledCloptimaLLMObservability,
@@ -37,14 +43,23 @@ const {
   instrumentOpenAICompatibleStream,
   extractOpenAIUsage,
   extractOpenAIStreamUsage,
+  getProviderStreamUsageExtractor,
+  getProviderUsageExtractor,
+  listSupportedProviders,
   previewBatchPayload,
   previewEventPayload,
   previewOtlpRequest,
+  PROVIDER_SUPPORT_MATRIX,
+  PROVIDER_USAGE_EXTRACTORS,
+  tryExtractUsage,
   extractVertexStreamUsage,
   extractVertexUsage,
   initFromEnv,
   isEnabled,
   validatePayload,
+  withTask,
+  withWorkflow,
+  withUsageOverrides,
 } = await import(`${buildDir}/src/index.js`);
 
 function camelExpected(expected) {
@@ -95,6 +110,15 @@ test('initFromEnv returns a silent disabled client when not configured', async (
     call: () => 'passthrough-result',
     featureId: 'summaries',
   }), 'passthrough-result');
+});
+
+test('entrypoint avoids a static node async_hooks import for broader runtime compatibility', () => {
+  const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+  const built = readFileSync(`${buildDir}/src/index.js`, 'utf8');
+
+  assert.doesNotMatch(source, /import\s+\{\s*AsyncLocalStorage\s*\}\s+from\s+['"]node:async_hooks['"]/);
+  assert.doesNotMatch(built, /import\s+\{\s*AsyncLocalStorage\s*\}\s+from\s+['"]node:async_hooks['"]/);
+  assert.match(built, /StackAttributionContextStorage/);
 });
 
 test('initFromEnv can build a configured client from env', async () => {
@@ -841,6 +865,363 @@ test('observeCall accepts flat attribution fields and per-call metadata privacy 
   assert.equal(body.metadata.workflow_id, 'support-agent');
   assert.equal(body.metadata.route, '/summaries');
   assert.equal(body.metadata.prompt, undefined);
+});
+
+test('runWithAttribution applies ambient attribution and keeps explicit per-call overrides', async () => {
+  const bodies = [];
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+    },
+    fetchImpl: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  await client.runWithAttribution({
+    teamId: 'platform',
+    featureId: 'summaries',
+    workflowId: 'ambient-workflow',
+  }, async () => {
+    await Promise.resolve();
+    await client.record({
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+    });
+    await client.observeCall({
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      call: () => ({
+        id: 'chatcmpl-context-1',
+        model: 'gpt-4o-mini',
+        usage: {
+          prompt_tokens: 3,
+          completion_tokens: 2,
+          total_tokens: 5,
+        },
+      }),
+      extractUsage: extractOpenAIUsage,
+      workflowId: 'explicit-workflow',
+      fireAndForget: false,
+    });
+  });
+
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].metadata.team_id, 'platform');
+  assert.equal(bodies[0].metadata.feature_id, 'summaries');
+  assert.equal(bodies[0].metadata.workflow_id, 'ambient-workflow');
+  assert.equal(bodies[1].metadata.team_id, 'platform');
+  assert.equal(bodies[1].metadata.feature_id, 'summaries');
+  assert.equal(bodies[1].metadata.workflow_id, 'explicit-workflow');
+});
+
+test('runWithAttribution preserves context for async generator callbacks', async () => {
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+    },
+    fetchImpl: async () => new Response('{}', { status: 202 }),
+  });
+
+  const workflowIds = [];
+  const stream = client.runWithAttribution({
+    workflowId: 'ambient-stream',
+  }, async function* () {
+    await Promise.resolve();
+    yield previewEventPayload({
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+    }, {
+      defaultAttribution: {
+        appId: 'agent-api',
+        environment: 'dev',
+      },
+    }).metadata.workflow_id;
+  });
+
+  for await (const workflowId of stream) {
+    workflowIds.push(workflowId);
+  }
+
+  assert.deepEqual(workflowIds, ['ambient-stream']);
+});
+
+test('withWorkflow and withTask set named attribution defaults while preserving explicit overrides', async () => {
+  const bodies = [];
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+    },
+    fetchImpl: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  await client.withWorkflow('order-checkout', async () => {
+    await withTask('llm-summary', async () => {
+      await client.record({
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+      });
+    });
+
+    await withTask('ignored-task-name', async () => {
+      await client.record({
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        featureId: 'explicit-feature',
+      });
+    });
+  });
+
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].metadata.workflow_id, 'order-checkout');
+  assert.equal(bodies[0].metadata.feature_id, 'llm-summary');
+  assert.equal(bodies[1].metadata.workflow_id, 'order-checkout');
+  assert.equal(bodies[1].metadata.feature_id, 'explicit-feature');
+
+  const preview = await withWorkflow('preview-workflow', async () => withTask('preview-task', () => (
+    previewEventPayload(
+      {
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+      },
+      {
+        defaultAttribution: {
+          appId: 'agent-api',
+          environment: 'dev',
+        },
+      },
+    )
+  )));
+  assert.equal(preview.metadata.workflow_id, 'preview-workflow');
+  assert.equal(preview.metadata.feature_id, 'preview-task');
+});
+
+test('createObservedCall and createObservedStream reduce wrapper boilerplate and preserve overrides', async () => {
+  const bodies = [];
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+    },
+    fetchImpl: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  const observeOpenAI = createObservedCall(client, {
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    extractUsage: extractOpenAIUsage,
+    attribution: { featureId: 'wrapper-default' },
+    metadata: { channel: 'sync' },
+    fireAndForget: false,
+  });
+
+  const response = await observeOpenAI(
+    () => ({
+      id: 'chatcmpl-factory-1',
+      model: 'gpt-4o-mini',
+      usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+    }),
+    {
+      attribution: { workflowId: 'wrapper-invoke' },
+      metadata: { operation: 'summarize' },
+    },
+  );
+
+  const observeStream = createObservedStream(client, {
+    provider: 'anthropic',
+    model: 'claude-3-5-sonnet',
+    extractUsage: extractAnthropicStreamUsage,
+    metadata: { channel: 'stream' },
+    fireAndForget: false,
+  });
+
+  const emitted = [];
+  for await (const chunk of observeStream(async function* () {
+    yield { message: { id: 'msg-factory-1', model: 'claude-3-5-sonnet' } };
+    yield { usage: { input_tokens: 4, output_tokens: 2 } };
+  }, {
+    attribution: { workflowId: 'wrapper-stream' },
+  })) {
+    emitted.push(chunk);
+  }
+
+  assert.equal(response.id, 'chatcmpl-factory-1');
+  assert.equal(emitted.length, 2);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].metadata.feature_id, 'wrapper-default');
+  assert.equal(bodies[0].metadata.workflow_id, 'wrapper-invoke');
+  assert.equal(bodies[0].metadata.channel, 'sync');
+  assert.equal(bodies[0].metadata.operation, 'summarize');
+  assert.equal(bodies[1].metadata.workflow_id, 'wrapper-stream');
+  assert.equal(bodies[1].metadata.channel, 'stream');
+});
+
+test('bindObservedCall and bindObservedStream wrap existing service methods with per-invocation overrides', async () => {
+  const bodies = [];
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+    },
+    fetchImpl: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  class ProviderService {
+    async generate(prompt, requestId) {
+      return {
+        id: `chatcmpl-${requestId}`,
+        model: 'gpt-4o-mini',
+        usage: { prompt_tokens: prompt.length, completion_tokens: 2, total_tokens: prompt.length + 2 },
+      };
+    }
+
+    async *stream(prompt, requestId) {
+      yield { message: { id: `msg-${requestId}`, model: 'claude-3-5-sonnet' } };
+      yield { usage: { input_tokens: prompt.length, output_tokens: 1 } };
+    }
+  }
+
+  const service = new ProviderService();
+  const observedGenerate = bindObservedCall(
+    client,
+    service.generate.bind(service),
+    {
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      extractUsage: extractOpenAIUsage,
+      metadata: { service: 'provider-service' },
+      fireAndForget: false,
+    },
+    (_prompt, requestId) => ({
+      requestId,
+      attribution: { workflowId: `wf-${requestId}` },
+    }),
+  );
+  const observedStream = bindObservedStream(
+    client,
+    service.stream.bind(service),
+    {
+      provider: 'anthropic',
+      model: 'claude-3-5-sonnet',
+      extractUsage: extractAnthropicStreamUsage,
+      metadata: { service: 'provider-service-stream' },
+      fireAndForget: false,
+    },
+    (_prompt, requestId) => ({
+      requestId,
+      attribution: { workflowId: `wf-${requestId}` },
+    }),
+  );
+
+  const response = await observedGenerate('hello', 'req-123');
+  const streamChunks = [];
+  for await (const chunk of observedStream('hey', 'req-456')) {
+    streamChunks.push(chunk);
+  }
+
+  assert.equal(response.id, 'chatcmpl-req-123');
+  assert.equal(streamChunks.length, 2);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].request_id, 'req-123');
+  assert.equal(bodies[0].metadata.workflow_id, 'wf-req-123');
+  assert.equal(bodies[0].metadata.service, 'provider-service');
+  assert.equal(bodies[1].request_id, 'req-456');
+  assert.equal(bodies[1].metadata.workflow_id, 'wf-req-456');
+  assert.equal(bodies[1].metadata.service, 'provider-service-stream');
+});
+
+test('wrapObservedService wraps multiple existing service methods together', async () => {
+  const { wrapObservedService } = await import(`${buildDir}/src/index.js`);
+  const bodies = [];
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+    },
+    fetchImpl: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  class SharedAIService {
+    plainHelper() {
+      return 'helper-ok';
+    }
+
+    async summarize(text, requestId) {
+      return {
+        id: `chatcmpl-${requestId}`,
+        model: 'gpt-4o-mini',
+        usage: { prompt_tokens: text.length, completion_tokens: 2, total_tokens: text.length + 2 },
+      };
+    }
+
+    async *streamReply(text, requestId) {
+      yield { message: { id: `msg-${requestId}`, model: 'claude-3-5-sonnet' } };
+      yield { usage: { input_tokens: text.length, output_tokens: 1 } };
+    }
+  }
+
+  const wrapped = wrapObservedService(client, new SharedAIService(), {
+    summarize: {
+      kind: 'call',
+      options: {
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        extractUsage: extractOpenAIUsage,
+        fireAndForget: false,
+      },
+      resolveOverrides: (_text, requestId) => ({ requestId }),
+    },
+    streamReply: {
+      kind: 'stream',
+      options: {
+        provider: 'anthropic',
+        model: 'claude-3-5-sonnet',
+        extractUsage: extractAnthropicStreamUsage,
+        fireAndForget: false,
+      },
+      resolveOverrides: (_text, requestId) => ({ requestId }),
+    },
+  });
+
+  const response = await wrapped.summarize('hello', 'svc-1');
+  const chunks = [];
+  for await (const chunk of wrapped.streamReply('hey', 'svc-2')) {
+    chunks.push(chunk);
+  }
+
+  assert.equal(response.id, 'chatcmpl-svc-1');
+  assert.equal(chunks.length, 2);
+  assert.equal(wrapped.plainHelper(), 'helper-ok');
+  assert.equal(bodies[0].request_id, 'svc-1');
+  assert.equal(bodies[1].request_id, 'svc-2');
 });
 
 test('createInstrumentedFetch wraps fetch and records openai-compatible usage', async () => {
@@ -1687,6 +2068,232 @@ test('provider usage extractors normalize common response shapes', () => {
       provider: 'azure_openai',
     },
   );
+});
+
+test('provider extractors accept object-like responses and composition helpers', () => {
+  class OpenAIModel {
+    model_dump() {
+      return {
+        id: 'chatcmpl-model-dump',
+        model: 'gpt-4o-mini',
+        usage: {
+          prompt_tokens: 8,
+          completion_tokens: 5,
+          total_tokens: 13,
+        },
+      };
+    }
+  }
+
+  class GeminiModel {
+    dict() {
+      return {
+        responseId: 'gemini-dict-1',
+        modelVersion: 'gemini-2.5-flash',
+        usageMetadata: {
+          promptTokenCount: 6,
+          responseTokenCount: 4,
+          totalTokenCount: 10,
+        },
+      };
+    }
+  }
+
+  class BedrockModel {
+    toJSON() {
+      return {
+        request_id: 'bedrock-json-1',
+        model_id: 'anthropic.claude-3-5-sonnet',
+        usage: {
+          input_tokens: 12,
+          output_tokens: 3,
+          total_tokens: 15,
+        },
+      };
+    }
+  }
+
+  assert.deepEqual(
+    stripUndefined(extractOpenAIUsage(new OpenAIModel())),
+    {
+      provider: 'openai',
+      providerRequestId: 'chatcmpl-model-dump',
+      model: 'gpt-4o-mini',
+      inputTokens: 8,
+      outputTokens: 5,
+      totalTokens: 13,
+    },
+  );
+
+  assert.deepEqual(
+    stripUndefined(extractGeminiUsage(new GeminiModel())),
+    {
+      provider: 'gemini',
+      providerRequestId: 'gemini-dict-1',
+      model: 'gemini-2.5-flash',
+      inputTokens: 6,
+      outputTokens: 4,
+      totalTokens: 10,
+    },
+  );
+
+  assert.deepEqual(
+    stripUndefined(extractBedrockUsage(new BedrockModel())),
+    {
+      provider: 'bedrock',
+      providerRequestId: 'bedrock-json-1',
+      model: 'anthropic.claude-3-5-sonnet',
+      inputTokens: 12,
+      outputTokens: 3,
+      totalTokens: 15,
+    },
+  );
+
+  const fallbackExtractor = composeUsageExtractors(
+    () => ({}),
+    extractOpenAIUsage,
+  );
+  assert.deepEqual(
+    stripUndefined(fallbackExtractor(new OpenAIModel())),
+    {
+      provider: 'openai',
+      providerRequestId: 'chatcmpl-model-dump',
+      model: 'gpt-4o-mini',
+      inputTokens: 8,
+      outputTokens: 5,
+      totalTokens: 13,
+    },
+  );
+
+  assert.deepEqual(
+    stripUndefined(tryExtractUsage(new GeminiModel(), () => ({}), extractGeminiUsage)),
+    {
+      provider: 'gemini',
+      providerRequestId: 'gemini-dict-1',
+      model: 'gemini-2.5-flash',
+      inputTokens: 6,
+      outputTokens: 4,
+      totalTokens: 10,
+    },
+  );
+
+  const overridden = withUsageOverrides(extractAnthropicUsage, (extracted) => ({
+    ...extracted,
+    outputTokens: 9,
+  }));
+  assert.deepEqual(
+    stripUndefined(overridden({
+      id: 'msg-override-1',
+      model: 'claude-3-5-sonnet',
+      usage: {
+        input_tokens: 4,
+        output_tokens: 2,
+        total_tokens: 6,
+      },
+    })),
+    {
+      provider: 'anthropic',
+      providerRequestId: 'msg-override-1',
+      model: 'claude-3-5-sonnet',
+      inputTokens: 4,
+      outputTokens: 9,
+      totalTokens: 6,
+    },
+  );
+});
+
+test('createMappedUsageExtractor maps nested custom payloads without full custom extractor code', () => {
+  const extractor = createMappedUsageExtractor({
+    defaults: {
+      provider: 'custom_provider',
+    },
+    fields: {
+      providerRequestId: ['response.id', 'meta.request_id'],
+      model: 'meta.model_name',
+      status: 'meta.status',
+    },
+    numberFields: {
+      inputTokens: 'usage.input',
+      outputTokens: 'usage.output',
+      totalTokens: 'usage.total',
+      latencyMs: 'timing.latency_ms',
+    },
+    booleanFields: {
+      cacheHit: 'cache.hit',
+    },
+    extraUsageUnits: {
+      images: 'usage.images_generated',
+    },
+    metadata: {
+      region: 'meta.region',
+      route: 'meta.route',
+    },
+  });
+
+  assert.deepEqual(
+    extractor({
+      response: { id: 'resp-custom-1' },
+      meta: {
+        model_name: 'custom-model',
+        status: 'succeeded',
+        region: 'us-central1',
+        route: '/v1/generate',
+      },
+      usage: {
+        input: 7,
+        output: 3,
+        total: 10,
+        images_generated: 2,
+      },
+      timing: { latency_ms: 145 },
+      cache: { hit: true },
+    }),
+    {
+      provider: 'custom_provider',
+      providerRequestId: 'resp-custom-1',
+      model: 'custom-model',
+      status: 'succeeded',
+      inputTokens: 7,
+      outputTokens: 3,
+      totalTokens: 10,
+      latencyMs: 145,
+      cacheHit: true,
+      extraUsageUnits: { images: 2 },
+      metadata: {
+        region: 'us-central1',
+        route: '/v1/generate',
+      },
+    },
+  );
+});
+
+test('provider extractor registry resolves aliases and fixture coverage stays aligned', () => {
+  assert.equal(getProviderUsageExtractor('azure'), extractAzureOpenAIUsage);
+  assert.equal(getProviderUsageExtractor('vertex-ai'), extractVertexUsage);
+  assert.equal(getProviderStreamUsageExtractor('bedrock'), extractBedrockStreamUsage);
+  assert.equal(getProviderUsageExtractor(), undefined);
+  assert.equal(getProviderStreamUsageExtractor(), undefined);
+  assert.ok(PROVIDER_USAGE_EXTRACTORS.some((descriptor) => descriptor.provider === 'openai'));
+  assert.deepEqual(listSupportedProviders(), PROVIDER_SUPPORT_MATRIX);
+  assert.ok(PROVIDER_SUPPORT_MATRIX.every((descriptor) => descriptor.response === true));
+  assert.ok(PROVIDER_SUPPORT_MATRIX.some((descriptor) => descriptor.provider === 'anthropic' && descriptor.stream === true));
+  assert.throws(() => {
+    PROVIDER_USAGE_EXTRACTORS.push({
+      provider: 'fake',
+      aliases: ['fake'],
+      responseExtractor: () => ({}),
+    });
+  });
+  assert.throws(() => {
+    PROVIDER_USAGE_EXTRACTORS[0].aliases.push('mutated');
+  });
+
+  for (const fixture of providerUsageReplayFixtures) {
+    const extractor = fixture.kind === 'stream'
+      ? getProviderStreamUsageExtractor(fixture.provider)
+      : getProviderUsageExtractor(fixture.provider);
+    assert.ok(extractor, `missing registry extractor for ${fixture.provider}/${fixture.kind}`);
+  }
 });
 
 test('provider usage fixture replay covers supported SDK extractors', () => {

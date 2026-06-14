@@ -1,13 +1,15 @@
 import {
   extractOpenAIUsage,
   initFromEnv,
+  wrapObservedService,
 } from "@cloptima/llm-observability"
 
 class SummaryService {
-  generateSummary() {
+  generateSummary(prompt) {
     return {
       id: "chatcmpl-wrapper-example",
       model: "gpt-4.1-mini",
+      input: prompt,
       usage: {
         prompt_tokens: 12,
         completion_tokens: 7,
@@ -17,7 +19,6 @@ class SummaryService {
   }
 }
 
-const summaryService = new SummaryService()
 const cloptima = initFromEnv({
   env: {
     CLOPTIMA_LLM_OBSERVABILITY_API_KEY: "cloptima_pat_example",
@@ -32,15 +33,27 @@ const cloptima = initFromEnv({
     return new Response("{}", { status: 202 })
   },
 })
-
-await cloptima.observeCall({
-  provider: "openai",
-  model: "gpt-4.1-mini",
-  call: () => summaryService.generateSummary(),
-  extractUsage: extractOpenAIUsage,
-  fireAndForget: false,
-  featureId: "support_summary",
-  metadata: {
-    integration_mode: "shared_service",
+const summaryService = wrapObservedService(cloptima, new SummaryService(), {
+  generateSummary: {
+    kind: "call",
+    options: {
+      provider: "openai",
+      model: "gpt-4.1-mini",
+      extractUsage: extractOpenAIUsage,
+      fireAndForget: false,
+      metadata: {
+        integration_mode: "shared_service",
+      },
+    },
+    resolveOverrides: (prompt) => ({
+      attribution: {
+        featureId: "support_summary",
+      },
+      metadata: {
+        prompt_length: prompt.length,
+      },
+    }),
   },
 })
+
+await summaryService.generateSummary("Summarize the customer thread.")

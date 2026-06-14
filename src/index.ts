@@ -1,5 +1,28 @@
 export type CloptimaFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http';
+export type LLMUsageExtractor<T = unknown> = (input: T) => Partial<LLMUsageEvent>;
+export type UsageFieldPath = string;
+export type UsageFieldPaths = UsageFieldPath | UsageFieldPath[];
+export type ProviderUsageExtractorDescriptor = {
+  provider: string;
+  aliases: readonly string[];
+  responseExtractor: LLMUsageExtractor<unknown>;
+  streamExtractor?: LLMUsageExtractor<unknown[]>;
+};
+export type MappedUsageExtractorConfig = {
+  defaults?: Partial<LLMUsageEvent>;
+  fields?: Partial<Record<
+    'provider' | 'providerRequestId' | 'model' | 'requestId' | 'traceId' | 'status' | 'vendorReportedCostUsd' | 'errorMessage',
+    UsageFieldPaths
+  >>;
+  numberFields?: Partial<Record<
+    'inputTokens' | 'outputTokens' | 'totalTokens' | 'reasoningTokens' | 'cachedInputTokens' | 'latencyMs',
+    UsageFieldPaths
+  >>;
+  booleanFields?: Partial<Record<'cacheHit', UsageFieldPaths>>;
+  extraUsageUnits?: Record<string, UsageFieldPaths>;
+  metadata?: Record<string, UsageFieldPaths>;
+};
 const INTERNAL_DUAL_DELIVERY_MODE = 'dual';
 const INTERNAL_DUAL_DELIVERY_MODE_ENABLED = false;
 type InternalLLMObservabilityDeliveryMode = LLMObservabilityDeliveryMode | typeof INTERNAL_DUAL_DELIVERY_MODE;
@@ -19,10 +42,6 @@ export type LLMAttribution = {
   environment: string;
   actorId?: string;
   actorType?: 'human' | 'service' | 'agent';
-  developerId?: string;
-  cloudAccountId?: string;
-  clusterId?: string;
-  repositoryId?: string;
 };
 
 export type LLMAgentContext = {
@@ -35,6 +54,59 @@ export type LLMAgentContext = {
   retryIndex?: number;
   loopIteration?: number;
 };
+
+type AttributionContext = Partial<LLMAttribution>;
+type AttributionContextStorage = {
+  getStore(): AttributionContext | undefined;
+  run<R>(store: AttributionContext, callback: () => R): R;
+};
+type AsyncLocalStorageLike<T> = {
+  getStore(): T | undefined;
+  run<R>(store: T, callback: () => R): R;
+};
+type AsyncLocalStorageLikeCtor = new <T>() => AsyncLocalStorageLike<T>;
+
+class StackAttributionContextStorage implements AttributionContextStorage {
+  private readonly stack: AttributionContext[] = [];
+
+  getStore(): AttributionContext | undefined {
+    return this.stack[this.stack.length - 1];
+  }
+
+  run<R>(store: AttributionContext, callback: () => R): R {
+    this.stack.push(store);
+    try {
+      return callback();
+    } finally {
+      this.stack.pop();
+    }
+  }
+}
+
+async function resolveAsyncLocalStorageCtor(): Promise<AsyncLocalStorageLikeCtor | undefined> {
+  const globalCtor = (globalThis as { AsyncLocalStorage?: AsyncLocalStorageLikeCtor }).AsyncLocalStorage;
+  if (typeof globalCtor === 'function') {
+    return globalCtor;
+  }
+  try {
+    const nodeAsyncHooksSpecifier = 'node:async_hooks';
+    const module = await import(nodeAsyncHooksSpecifier);
+    if (typeof module.AsyncLocalStorage === 'function') {
+      return module.AsyncLocalStorage as AsyncLocalStorageLikeCtor;
+    }
+  } catch {}
+  return undefined;
+}
+
+async function createAttributionContextStorage(): Promise<AttributionContextStorage> {
+  const ctor = await resolveAsyncLocalStorageCtor();
+  if (ctor) {
+    return new ctor<AttributionContext>() as AttributionContextStorage;
+  }
+  return new StackAttributionContextStorage();
+}
+
+const attributionContextStorage = await createAttributionContextStorage();
 
 export type LLMUsage = {
   inputTokens?: number;
@@ -129,6 +201,9 @@ export type CloptimaLLMClientStats = {
 export interface LLMObservabilityClient {
   isEnabled(): boolean;
   getInitError(): Error | undefined;
+  runWithAttribution<T>(attribution: Partial<LLMAttribution>, callback: () => T | Promise<T>): T | Promise<T>;
+  withWorkflow<T>(name: string, callback: () => T | Promise<T>, attribution?: Partial<LLMAttribution>): T | Promise<T>;
+  withTask<T>(name: string, callback: () => T | Promise<T>, attribution?: Partial<LLMAttribution>): T | Promise<T>;
   record(event: LLMUsageEvent): Promise<void>;
   recordBatch(events: LLMUsageEvent[]): Promise<void>;
   recordAsync(event: LLMUsageEvent): void;
@@ -174,6 +249,28 @@ export type ObserveLLMStreamOptions<TChunk> = {
 export type ObserveCallOptions<T> = ObserveLLMCallOptions<T> & Partial<LLMAttribution>;
 
 export type ObserveStreamCallOptions<TChunk> = ObserveLLMStreamOptions<TChunk> & Partial<LLMAttribution>;
+
+export type ObservedCallFactoryOptions<T> = Omit<ObserveLLMCallOptions<T>, 'call'>;
+export type ObservedStreamFactoryOptions<TChunk> = Omit<ObserveLLMStreamOptions<TChunk>, 'call'>;
+export type ObservedCallOverridesResolver<TArgs extends unknown[], T> = (...args: TArgs) => Partial<ObservedCallFactoryOptions<T>> | undefined;
+export type ObservedStreamOverridesResolver<TArgs extends unknown[], TChunk> = (...args: TArgs) => Partial<ObservedStreamFactoryOptions<TChunk>> | undefined;
+export type ObservedServiceBinding =
+  | {
+    kind: 'call';
+    options: ObservedCallFactoryOptions<unknown>;
+    resolveOverrides?: (...args: unknown[]) => Partial<ObservedCallFactoryOptions<unknown>> | undefined;
+  }
+  | {
+    kind: 'stream';
+    options: ObservedStreamFactoryOptions<unknown>;
+    resolveOverrides?: (...args: unknown[]) => Partial<ObservedStreamFactoryOptions<unknown>> | undefined;
+  };
+export type ProviderSupportMatrixEntry = {
+  provider: string;
+  aliases: readonly string[];
+  response: boolean;
+  stream: boolean;
+};
 
 export type OpenAICompatibleInstrumentationOptions = {
   provider?: string;
@@ -329,11 +426,112 @@ function attributionFromFlatFields(options: Partial<LLMAttribution>): Partial<LL
     environment: cleanString(options.environment),
     actorId: cleanString(options.actorId),
     actorType: cleanString(options.actorType) as LLMAttribution['actorType'] | undefined,
-    developerId: cleanString(options.developerId),
-    cloudAccountId: cleanString(options.cloudAccountId),
-    clusterId: cleanString(options.clusterId),
-    repositoryId: cleanString(options.repositoryId),
   });
+}
+
+function currentAttributionContext(): Partial<LLMAttribution> {
+  return attributionContextStorage.getStore() || {};
+}
+
+function isIteratorLike<T>(value: unknown): value is Iterator<T> {
+  return Boolean(value)
+    && typeof value === 'object'
+    && typeof (value as { next?: unknown }).next === 'function'
+    && typeof (value as { [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function';
+}
+
+function isAsyncIteratorLike<T>(value: unknown): value is AsyncIterator<T> {
+  return Boolean(value)
+    && typeof value === 'object'
+    && typeof (value as { next?: unknown }).next === 'function'
+    && typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function';
+}
+
+function* attributedIterator<T>(
+  context: Partial<LLMAttribution>,
+  iterator: Iterator<T>,
+): Generator<T, void, unknown> {
+  while (true) {
+    const step = attributionContextStorage.run(context, () => iterator.next());
+    if (step.done) {
+      return;
+    }
+    yield step.value;
+  }
+}
+
+async function* attributedAsyncIterator<T>(
+  context: Partial<LLMAttribution>,
+  iterator: AsyncIterator<T>,
+): AsyncGenerator<T, void, unknown> {
+  while (true) {
+    const step = await attributionContextStorage.run(context, () => iterator.next());
+    if (step.done) {
+      return;
+    }
+    yield step.value;
+  }
+}
+
+function wrapAttributedResult<T>(context: Partial<LLMAttribution>, result: T): T {
+  if (isAsyncIteratorLike(result)) {
+    return attributedAsyncIterator(context, result) as T;
+  }
+  if (isIteratorLike(result)) {
+    return attributedIterator(context, result) as T;
+  }
+  return result;
+}
+
+function resolveAttributionContext(attribution?: Partial<LLMAttribution>): Partial<LLMAttribution> {
+  return stripUndefined({
+    ...currentAttributionContext(),
+    ...attributionFromFlatFields(attribution || {}),
+  });
+}
+
+export function runWithAttribution<T>(
+  attribution: Partial<LLMAttribution>,
+  callback: () => T | Promise<T>,
+): T | Promise<T> {
+  const context = resolveAttributionContext(attribution);
+  const result = attributionContextStorage.run(context, callback);
+  if (isPromiseLike<T>(result)) {
+    return result.then((resolved) => wrapAttributedResult(context, resolved)) as Promise<T>;
+  }
+  return wrapAttributedResult(context, result);
+}
+
+function namedContextAttribution(
+  key: 'workflowId' | 'featureId',
+  name: string,
+  attribution?: Partial<LLMAttribution>,
+): Partial<LLMAttribution> {
+  const resolved = attributionFromFlatFields(attribution || {});
+  const resolvedName = cleanString(name);
+  if (resolvedName && !resolved[key]) {
+    return {
+      ...resolved,
+      [key]: resolvedName,
+    };
+  }
+  return resolved;
+}
+
+export function withWorkflow<T>(
+  name: string,
+  callback: () => T | Promise<T>,
+  attribution?: Partial<LLMAttribution>,
+): T | Promise<T> {
+  return runWithAttribution(namedContextAttribution('workflowId', name, attribution), callback);
+}
+
+export function withTask<T>(
+  name: string,
+  callback: () => T | Promise<T>,
+  attribution?: Partial<LLMAttribution>,
+): T | Promise<T> {
+  return runWithAttribution(namedContextAttribution('featureId', name, attribution), callback);
 }
 
 function resolveObserveCallAttribution(options: {
@@ -356,6 +554,54 @@ function observeStreamCallOptions<TChunk>(options: ObserveStreamCallOptions<TChu
   return {
     ...options,
     attribution: resolveObserveCallAttribution(options),
+  };
+}
+
+function mergeObservedCallOptions<T>(
+  baseOptions: ObservedCallFactoryOptions<T>,
+  overrides: Partial<ObservedCallFactoryOptions<T>> | undefined,
+  call: () => Promise<T> | T,
+): ObserveLLMCallOptions<T> {
+  return {
+    ...baseOptions,
+    ...overrides,
+    call,
+    attribution: stripUndefined({
+      ...(baseOptions.attribution || {}),
+      ...(overrides?.attribution || {}),
+    }) as Partial<LLMAttribution>,
+    agent: stripUndefined({
+      ...(baseOptions.agent || {}),
+      ...(overrides?.agent || {}),
+    }) as Partial<LLMAgentContext>,
+    metadata: stripUndefined({
+      ...(baseOptions.metadata || {}),
+      ...(overrides?.metadata || {}),
+    }),
+  };
+}
+
+function mergeObservedStreamOptions<TChunk>(
+  baseOptions: ObservedStreamFactoryOptions<TChunk>,
+  overrides: Partial<ObservedStreamFactoryOptions<TChunk>> | undefined,
+  call: () => AsyncIterable<TChunk> | Iterable<TChunk> | Promise<AsyncIterable<TChunk> | Iterable<TChunk>>,
+): ObserveLLMStreamOptions<TChunk> {
+  return {
+    ...baseOptions,
+    ...overrides,
+    call,
+    attribution: stripUndefined({
+      ...(baseOptions.attribution || {}),
+      ...(overrides?.attribution || {}),
+    }) as Partial<LLMAttribution>,
+    agent: stripUndefined({
+      ...(baseOptions.agent || {}),
+      ...(overrides?.agent || {}),
+    }) as Partial<LLMAgentContext>,
+    metadata: stripUndefined({
+      ...(baseOptions.metadata || {}),
+      ...(overrides?.metadata || {}),
+    }),
   };
 }
 
@@ -422,6 +668,111 @@ function cleanString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || Array.isArray(value)) {
+    return undefined;
+  }
+  if (typeof value === 'object') {
+    return value as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function coerceObjectRecord(value: unknown): Record<string, unknown> | undefined {
+  const direct = objectRecord(value);
+  if (direct) {
+    const prototype = Object.getPrototypeOf(direct);
+    if (Object.keys(direct).length > 0 || prototype === Object.prototype || prototype === null) {
+      return direct;
+    }
+  }
+  if (!value || typeof value !== 'object') {
+    return direct;
+  }
+  const candidate = value as {
+    model_dump?: () => unknown;
+    dict?: () => unknown;
+    toJSON?: () => unknown;
+  };
+  if (typeof candidate.model_dump === 'function') {
+    try {
+      const dumped = objectRecord(candidate.model_dump());
+      if (dumped) {
+        return dumped;
+      }
+    } catch {}
+  }
+  if (typeof candidate.dict === 'function') {
+    try {
+      const dumped = objectRecord(candidate.dict());
+      if (dumped) {
+        return dumped;
+      }
+    } catch {}
+  }
+  if (typeof candidate.toJSON === 'function') {
+    try {
+      const dumped = objectRecord(candidate.toJSON());
+      if (dumped) {
+        return dumped;
+      }
+    } catch {}
+  }
+  if (direct) {
+    return direct;
+  }
+  return undefined;
+}
+
+function recordField(record: Record<string, unknown> | undefined, ...keys: string[]): unknown {
+  for (const key of keys) {
+    if (record && key in record) {
+      return record[key];
+    }
+  }
+  return undefined;
+}
+
+function nestedRecord(record: Record<string, unknown> | undefined, ...keys: string[]): Record<string, unknown> | undefined {
+  for (const key of keys) {
+    const nested = coerceObjectRecord(recordField(record, key));
+    if (nested) {
+      return nested;
+    }
+  }
+  return undefined;
+}
+
+function splitFieldPath(path: string): string[] {
+  return path.split('.').map((segment) => segment.trim()).filter(Boolean);
+}
+
+function pathValue(record: Record<string, unknown> | undefined, path: UsageFieldPath): unknown {
+  let current: unknown = record;
+  for (const segment of splitFieldPath(path)) {
+    const currentRecord = coerceObjectRecord(current);
+    if (!currentRecord || !(segment in currentRecord)) {
+      return undefined;
+    }
+    current = currentRecord[segment];
+  }
+  return current;
+}
+
+function resolveMappedValue(record: Record<string, unknown> | undefined, paths?: UsageFieldPaths): unknown {
+  if (!paths) {
+    return undefined;
+  }
+  const candidates = Array.isArray(paths) ? paths : [paths];
+  for (const candidate of candidates) {
+    const value = pathValue(record, candidate);
+    if (value !== undefined && value !== null && value !== '') {
+      return value;
+    }
+  }
+  return undefined;
+}
+
 function cleanBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
 }
@@ -468,6 +819,117 @@ function cleanUsageMap(value: unknown): Record<string, number> | undefined {
     }
   }
   return Object.keys(result).length ? result : undefined;
+}
+
+function hasMeaningfulExtraction(extracted: Partial<LLMUsageEvent>): boolean {
+  return Boolean(
+    extracted.provider
+      || extracted.model
+      || extracted.providerRequestId
+      || extracted.requestId
+      || extracted.traceId
+      || extracted.status
+      || extracted.inputTokens !== undefined
+      || extracted.outputTokens !== undefined
+      || extracted.totalTokens !== undefined
+      || extracted.reasoningTokens !== undefined
+      || extracted.cachedInputTokens !== undefined
+      || extracted.vendorReportedCostUsd !== undefined
+      || extracted.latencyMs !== undefined
+      || extracted.cacheHit !== undefined
+      || (extracted.extraUsageUnits && Object.keys(extracted.extraUsageUnits).length > 0)
+      || (extracted.metadata && Object.keys(extracted.metadata).length > 0)
+  );
+}
+
+export function tryExtractUsage<T>(
+  input: T,
+  ...extractors: Array<LLMUsageExtractor<T> | undefined>
+): Partial<LLMUsageEvent> {
+  for (const extractor of extractors) {
+    if (!extractor) {
+      continue;
+    }
+    try {
+      const extracted = extractor(input) || {};
+      if (hasMeaningfulExtraction(extracted)) {
+        return extracted;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return {};
+}
+
+export function composeUsageExtractors<T>(
+  ...extractors: Array<LLMUsageExtractor<T> | undefined>
+): LLMUsageExtractor<T> {
+  return (input: T) => tryExtractUsage(input, ...extractors);
+}
+
+export function withUsageOverrides<T>(
+  extractor: LLMUsageExtractor<T>,
+  overrides: Partial<LLMUsageEvent> | ((extracted: Partial<LLMUsageEvent>, input: T) => Partial<LLMUsageEvent>),
+): LLMUsageExtractor<T> {
+  return (input: T) => {
+    const extracted = extractor(input) || {};
+    const overrideValues = typeof overrides === 'function' ? overrides(extracted, input) : overrides;
+    return stripUndefined({
+      ...extracted,
+      ...overrideValues,
+    }) as Partial<LLMUsageEvent>;
+  };
+}
+
+export function createMappedUsageExtractor<T = unknown>(
+  config: MappedUsageExtractorConfig,
+): LLMUsageExtractor<T> {
+  return (input: T) => {
+    const record = coerceObjectRecord(input) || {};
+    const extracted: Partial<LLMUsageEvent> = {
+      ...(config.defaults || {}),
+    };
+    for (const [field, paths] of Object.entries(config.fields || {})) {
+      const value = resolveMappedValue(record, paths);
+      if (field === 'provider' || field === 'providerRequestId' || field === 'model' || field === 'requestId' || field === 'traceId' || field === 'status' || field === 'errorMessage') {
+        (extracted as Record<string, unknown>)[field] = cleanString(value);
+      } else if (field === 'vendorReportedCostUsd') {
+        (extracted as Record<string, unknown>)[field] = cleanDecimal(value) ?? cleanString(value);
+      }
+    }
+    for (const [field, paths] of Object.entries(config.numberFields || {})) {
+      (extracted as Record<string, unknown>)[field] = cleanNumber(resolveMappedValue(record, paths));
+    }
+    for (const [field, paths] of Object.entries(config.booleanFields || {})) {
+      if (field === 'cacheHit') {
+        (extracted as Record<string, unknown>)[field] = cleanBoolean(resolveMappedValue(record, paths));
+      }
+    }
+    if (config.extraUsageUnits) {
+      extracted.extraUsageUnits = cleanUsageMap(
+        Object.fromEntries(
+          Object.entries(config.extraUsageUnits).map(([key, paths]) => [key, resolveMappedValue(record, paths)]),
+        ),
+      );
+    }
+    if (config.metadata) {
+      extracted.metadata = stripUndefined(
+        Object.fromEntries(
+          Object.entries(config.metadata).map(([key, paths]) => [key, resolveMappedValue(record, paths)]),
+        ),
+      );
+      if (Object.keys(extracted.metadata).length === 0) {
+        delete extracted.metadata;
+      }
+    }
+    if (extracted.totalTokens === undefined && (
+      extracted.inputTokens !== undefined || extracted.outputTokens !== undefined
+    )) {
+      extracted.totalTokens = (extracted.inputTokens || 0) + (extracted.outputTokens || 0);
+    }
+    return stripUndefined(extracted) as Partial<LLMUsageEvent>;
+  };
 }
 
 const DEFAULT_METADATA_PRIVACY_MODE: MetadataPrivacyMode = 'metadata_only';
@@ -802,10 +1264,6 @@ function otlpAttributesFromPayload(payload: Record<string, unknown>): Array<Reco
     ['release', cleanString(metadata.release)],
     ['actor_id', cleanString(metadata.actor_id)],
     ['actor_type', cleanString(metadata.actor_type)],
-    ['developer_id', cleanString(metadata.developer_id)],
-    ['cloud_account_id', cleanString(metadata.cloud_account_id)],
-    ['cluster_id', cleanString(metadata.cluster_id)],
-    ['repository_id', cleanString(metadata.repository_id)],
     ['agent_session_id', cleanString(metadata.agent_session_id)],
     ['agent_run_id', cleanString(metadata.agent_run_id)],
     ['parent_execution_id', cleanString(metadata.parent_execution_id)],
@@ -1002,7 +1460,7 @@ function buildPayload(
   metadataPrivacy: ResolvedMetadataPrivacyOptions,
   sdkVersion?: string,
 ): Record<string, unknown> {
-  const attribution = { ...defaults, ...event };
+  const attribution = { ...defaults, ...currentAttributionContext(), ...event };
   const inputTokens = cleanNumber(event.inputTokens);
   const outputTokens = cleanNumber(event.outputTokens);
   const totalTokens = cleanNumber(event.totalTokens) ?? (
@@ -1050,10 +1508,6 @@ function buildPayload(
         environment: attribution.environment,
         actor_id: attribution.actorId,
         actor_type: attribution.actorType,
-        developer_id: attribution.developerId,
-        cloud_account_id: attribution.cloudAccountId,
-        cluster_id: attribution.clusterId,
-        repository_id: attribution.repositoryId,
         agent_session_id: event.agentSessionId,
         agent_run_id: event.agentRunId,
         parent_execution_id: event.parentExecutionId,
@@ -1151,6 +1605,18 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
 
   getInitError(): Error | undefined {
     return undefined;
+  }
+
+  runWithAttribution<T>(attribution: Partial<LLMAttribution>, callback: () => T | Promise<T>): T | Promise<T> {
+    return runWithAttribution(attribution, callback);
+  }
+
+  withWorkflow<T>(name: string, callback: () => T | Promise<T>, attribution?: Partial<LLMAttribution>): T | Promise<T> {
+    return withWorkflow(name, callback, attribution);
+  }
+
+  withTask<T>(name: string, callback: () => T | Promise<T>, attribution?: Partial<LLMAttribution>): T | Promise<T> {
+    return withTask(name, callback, attribution);
   }
 
   async record(event: LLMUsageEvent): Promise<void> {
@@ -1571,6 +2037,18 @@ export class DisabledCloptimaLLMObservability implements LLMObservabilityClient 
     return this.initError;
   }
 
+  runWithAttribution<T>(attribution: Partial<LLMAttribution>, callback: () => T | Promise<T>): T | Promise<T> {
+    return runWithAttribution(attribution, callback);
+  }
+
+  withWorkflow<T>(name: string, callback: () => T | Promise<T>, attribution?: Partial<LLMAttribution>): T | Promise<T> {
+    return withWorkflow(name, callback, attribution);
+  }
+
+  withTask<T>(name: string, callback: () => T | Promise<T>, attribution?: Partial<LLMAttribution>): T | Promise<T> {
+    return withTask(name, callback, attribution);
+  }
+
   async record(_event: LLMUsageEvent): Promise<void> {}
 
   async recordBatch(_events: LLMUsageEvent[]): Promise<void> {}
@@ -1660,10 +2138,6 @@ function resolvedInitAttribution(options: InitFromEnvOptions | undefined): Parti
     environment: cleanString(options?.defaultAttribution?.environment) || cleanString(env[INIT_ENVIRONMENT_ENV]) || 'production',
     actorId: cleanString(options?.defaultAttribution?.actorId),
     actorType: cleanString(options?.defaultAttribution?.actorType) as LLMAttribution['actorType'] | undefined,
-    developerId: cleanString(options?.defaultAttribution?.developerId),
-    cloudAccountId: cleanString(options?.defaultAttribution?.cloudAccountId),
-    clusterId: cleanString(options?.defaultAttribution?.clusterId),
-    repositoryId: cleanString(options?.defaultAttribution?.repositoryId),
   });
 }
 
@@ -1727,21 +2201,89 @@ export function initFromEnv(
   });
 }
 
-export function extractOpenAIUsage(response: Record<string, unknown>): Partial<LLMUsageEvent> {
-  const usage = response.usage && typeof response.usage === 'object'
-    ? response.usage as Record<string, unknown>
-    : {};
-  const promptDetails = usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object'
-    ? usage.prompt_tokens_details as Record<string, unknown>
-    : {};
-  const completionDetails = usage.completion_tokens_details && typeof usage.completion_tokens_details === 'object'
-    ? usage.completion_tokens_details as Record<string, unknown>
-    : {};
+export function createObservedCall<T>(
+  client: LLMObservabilityClient,
+  baseOptions: ObservedCallFactoryOptions<T>,
+): (
+  call: () => Promise<T> | T,
+  overrides?: Partial<ObservedCallFactoryOptions<T>>,
+) => Promise<T> {
+  return (call, overrides) => client.observe(mergeObservedCallOptions(baseOptions, overrides, call));
+}
+
+export function createObservedStream<TChunk>(
+  client: LLMObservabilityClient,
+  baseOptions: ObservedStreamFactoryOptions<TChunk>,
+): (
+  call: () => AsyncIterable<TChunk> | Iterable<TChunk> | Promise<AsyncIterable<TChunk> | Iterable<TChunk>>,
+  overrides?: Partial<ObservedStreamFactoryOptions<TChunk>>,
+) => AsyncGenerator<TChunk, void, unknown> {
+  return (call, overrides) => client.observeStream(mergeObservedStreamOptions(baseOptions, overrides, call));
+}
+
+export function bindObservedCall<TArgs extends unknown[], T>(
+  client: LLMObservabilityClient,
+  method: (...args: TArgs) => Promise<T> | T,
+  baseOptions: ObservedCallFactoryOptions<T>,
+  resolveOverrides?: ObservedCallOverridesResolver<TArgs, T>,
+): (...args: TArgs) => Promise<T> {
+  return (...args: TArgs) => client.observe(
+    mergeObservedCallOptions(baseOptions, resolveOverrides?.(...args), () => method(...args)),
+  );
+}
+
+export function bindObservedStream<TArgs extends unknown[], TChunk>(
+  client: LLMObservabilityClient,
+  method: (...args: TArgs) => AsyncIterable<TChunk> | Iterable<TChunk> | Promise<AsyncIterable<TChunk> | Iterable<TChunk>>,
+  baseOptions: ObservedStreamFactoryOptions<TChunk>,
+  resolveOverrides?: ObservedStreamOverridesResolver<TArgs, TChunk>,
+): (...args: TArgs) => AsyncGenerator<TChunk, void, unknown> {
+  return (...args: TArgs) => client.observeStream(
+    mergeObservedStreamOptions(baseOptions, resolveOverrides?.(...args), () => method(...args)),
+  );
+}
+
+export function wrapObservedService<TService extends object>(
+  client: LLMObservabilityClient,
+  service: TService,
+  bindings: Record<string, ObservedServiceBinding>,
+): TService {
+  const wrapped = Object.assign(Object.create(Object.getPrototypeOf(service)), service) as Record<string, unknown>;
+  for (const [methodName, binding] of Object.entries(bindings)) {
+    const original = (service as Record<string, unknown>)[methodName];
+    if (typeof original !== 'function') {
+      throw new Error(`Cannot wrap non-function service method: ${methodName}`);
+    }
+    const bound = (original as (...args: unknown[]) => unknown).bind(service);
+    if (binding.kind === 'call') {
+      wrapped[methodName] = bindObservedCall(
+        client,
+        bound,
+        binding.options,
+        binding.resolveOverrides as ObservedCallOverridesResolver<unknown[], unknown> | undefined,
+      );
+    } else {
+      wrapped[methodName] = bindObservedStream(
+        client,
+        bound as (...args: unknown[]) => AsyncIterable<unknown> | Iterable<unknown> | Promise<AsyncIterable<unknown> | Iterable<unknown>>,
+        binding.options,
+        binding.resolveOverrides as ObservedStreamOverridesResolver<unknown[], unknown> | undefined,
+      );
+    }
+  }
+  return wrapped as TService;
+}
+
+export function extractOpenAIUsage(response: unknown): Partial<LLMUsageEvent> {
+  const record = coerceObjectRecord(response) || {};
+  const usage = nestedRecord(record, 'usage') || {};
+  const promptDetails = nestedRecord(usage, 'prompt_tokens_details', 'promptTokensDetails') || {};
+  const completionDetails = nestedRecord(usage, 'completion_tokens_details', 'completionTokensDetails') || {};
 
   return {
     provider: 'openai',
-    providerRequestId: cleanString(response.id),
-    model: cleanString(response.model),
+    providerRequestId: cleanString(recordField(record, 'id')),
+    model: cleanString(recordField(record, 'model')),
     inputTokens: cleanNumber(usage.prompt_tokens),
     outputTokens: cleanNumber(usage.completion_tokens),
     totalTokens: cleanNumber(usage.total_tokens),
@@ -1756,18 +2298,19 @@ export function extractOpenAIUsage(response: Record<string, unknown>): Partial<L
   };
 }
 
-export function extractOpenAIStreamUsage(chunks: Array<Record<string, unknown>>): Partial<LLMUsageEvent> {
+export function extractOpenAIStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
   let lastWithUsage: Record<string, unknown> | undefined;
   let providerRequestId: string | undefined;
   let model: string | undefined;
   for (const chunk of chunks) {
-    if (!chunk || typeof chunk !== 'object') {
+    const record = coerceObjectRecord(chunk);
+    if (!record) {
       continue;
     }
-    providerRequestId = cleanString(chunk.id) || providerRequestId;
-    model = cleanString(chunk.model) || model;
-    if (chunk.usage && typeof chunk.usage === 'object') {
-      lastWithUsage = chunk;
+    providerRequestId = cleanString(recordField(record, 'id')) || providerRequestId;
+    model = cleanString(recordField(record, 'model')) || model;
+    if (nestedRecord(record, 'usage')) {
+      lastWithUsage = record;
     }
   }
   if (!lastWithUsage) {
@@ -1781,26 +2324,26 @@ export function extractOpenAIStreamUsage(chunks: Array<Record<string, unknown>>)
   };
 }
 
-export function extractAzureOpenAIUsage(response: Record<string, unknown>): Partial<LLMUsageEvent> {
+export function extractAzureOpenAIUsage(response: unknown): Partial<LLMUsageEvent> {
+  const record = coerceObjectRecord(response) || {};
   const extracted = extractOpenAIUsage(response);
   return {
     ...extracted,
     provider: 'azure_openai',
-    model: extracted.model || cleanString(response.deployment_name) || cleanString(response.deployment) || cleanString(response.model),
+    model: extracted.model || cleanString(recordField(record, 'deployment_name', 'deployment', 'model')),
   };
 }
 
-export function extractAnthropicUsage(response: Record<string, unknown>): Partial<LLMUsageEvent> {
-  const usage = response.usage && typeof response.usage === 'object'
-    ? response.usage as Record<string, unknown>
-    : {};
+export function extractAnthropicUsage(response: unknown): Partial<LLMUsageEvent> {
+  const record = coerceObjectRecord(response) || {};
+  const usage = nestedRecord(record, 'usage') || {};
   const inputTokens = cleanNumber(usage.input_tokens);
   const outputTokens = cleanNumber(usage.output_tokens);
   const cachedInputTokens = cleanNumber(usage.cache_read_input_tokens);
   return {
     provider: 'anthropic',
-    providerRequestId: cleanString(response.id),
-    model: cleanString(response.model),
+    providerRequestId: cleanString(recordField(record, 'id')),
+    model: cleanString(recordField(record, 'model')),
     inputTokens,
     outputTokens,
     totalTokens: cleanNumber(usage.total_tokens) ?? (
@@ -1817,7 +2360,7 @@ export function extractAnthropicUsage(response: Record<string, unknown>): Partia
   };
 }
 
-export function extractAnthropicStreamUsage(chunks: Array<Record<string, unknown>>): Partial<LLMUsageEvent> {
+export function extractAnthropicStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
   let providerRequestId: string | undefined;
   let model: string | undefined;
   let inputTokens: number | undefined;
@@ -1825,17 +2368,18 @@ export function extractAnthropicStreamUsage(chunks: Array<Record<string, unknown
   let cachedInputTokens: number | undefined;
   let cacheWriteTokens: number | undefined;
   for (const chunk of chunks) {
-    if (!chunk || typeof chunk !== 'object') {
+    const record = coerceObjectRecord(chunk);
+    if (!record) {
       continue;
     }
     let usage: Record<string, unknown> = {};
-    if (chunk.message && typeof chunk.message === 'object') {
-      const message = chunk.message as Record<string, unknown>;
-      providerRequestId = cleanString(message.id) || providerRequestId;
-      model = cleanString(message.model) || model;
-      usage = message.usage && typeof message.usage === 'object' ? message.usage as Record<string, unknown> : {};
-    } else if (chunk.usage && typeof chunk.usage === 'object') {
-      usage = chunk.usage as Record<string, unknown>;
+    const message = nestedRecord(record, 'message');
+    if (message) {
+      providerRequestId = cleanString(recordField(message, 'id')) || providerRequestId;
+      model = cleanString(recordField(message, 'model')) || model;
+      usage = nestedRecord(message, 'usage') || {};
+    } else {
+      usage = nestedRecord(record, 'usage') || {};
     }
     inputTokens = cleanNumber(usage.input_tokens) ?? inputTokens;
     outputTokens = cleanNumber(usage.output_tokens) ?? outputTokens;
@@ -1856,51 +2400,43 @@ export function extractAnthropicStreamUsage(chunks: Array<Record<string, unknown
   };
 }
 
-export function extractGeminiUsage(response: Record<string, unknown>): Partial<LLMUsageEvent> {
-  let usage = response.usageMetadata && typeof response.usageMetadata === 'object'
-    ? response.usageMetadata as Record<string, unknown>
-    : {};
-  if (!Object.keys(usage).length) {
-    usage = response.usage_metadata && typeof response.usage_metadata === 'object'
-      ? response.usage_metadata as Record<string, unknown>
-      : {};
-  }
-  const cachedInputTokens = cleanNumber(usage.cachedContentTokenCount ?? usage.cached_content_token_count);
+export function extractGeminiUsage(response: unknown): Partial<LLMUsageEvent> {
+  const record = coerceObjectRecord(response) || {};
+  const usage = nestedRecord(record, 'usageMetadata', 'usage_metadata') || {};
+  const cachedInputTokens = cleanNumber(recordField(usage, 'cachedContentTokenCount', 'cached_content_token_count'));
   return {
-    provider: cleanString(response.provider) || 'gemini',
-    providerRequestId: cleanString(response.responseId) || cleanString(response.response_id) || cleanString(response.id) || cleanString(response.name),
-    model: cleanString(response.modelVersion) || cleanString(response.model_version) || cleanString(response.model),
-    inputTokens: cleanNumber(usage.promptTokenCount ?? usage.prompt_token_count),
-    outputTokens: cleanNumber(usage.candidatesTokenCount ?? usage.candidates_token_count),
-    totalTokens: cleanNumber(usage.totalTokenCount ?? usage.total_token_count),
-    reasoningTokens: cleanNumber(usage.thoughtsTokenCount ?? usage.thoughts_token_count),
+    provider: cleanString(recordField(record, 'provider')) || 'gemini',
+    providerRequestId: cleanString(recordField(record, 'responseId', 'response_id', 'id', 'name')),
+    model: cleanString(recordField(record, 'modelVersion', 'model_version', 'model')),
+    inputTokens: cleanNumber(recordField(usage, 'promptTokenCount', 'prompt_token_count', 'inputTokenCount', 'input_token_count')),
+    outputTokens: cleanNumber(recordField(usage, 'responseTokenCount', 'response_token_count', 'candidatesTokenCount', 'candidates_token_count', 'outputTokenCount', 'output_token_count')),
+    totalTokens: cleanNumber(recordField(usage, 'totalTokenCount', 'total_token_count')),
+    reasoningTokens: cleanNumber(recordField(usage, 'thoughtsTokenCount', 'thoughts_token_count', 'reasoningTokenCount', 'reasoning_token_count')),
     cachedInputTokens,
     cacheHit: cachedInputTokens ? true : undefined,
   };
 }
 
-export function extractVertexUsage(response: Record<string, unknown>): Partial<LLMUsageEvent> {
+export function extractVertexUsage(response: unknown): Partial<LLMUsageEvent> {
   return {
     ...extractGeminiUsage(response),
     provider: 'vertex_ai',
   };
 }
 
-export function extractGeminiStreamUsage(chunks: Array<Record<string, unknown>>): Partial<LLMUsageEvent> {
+export function extractGeminiStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
   let lastWithUsage: Record<string, unknown> | undefined;
   let providerRequestId: string | undefined;
   let model: string | undefined;
   for (const chunk of chunks) {
-    if (!chunk || typeof chunk !== 'object') {
+    const record = coerceObjectRecord(chunk);
+    if (!record) {
       continue;
     }
-    providerRequestId = cleanString(chunk.responseId) || cleanString(chunk.response_id) || cleanString(chunk.id) || cleanString(chunk.name) || providerRequestId;
-    model = cleanString(chunk.modelVersion) || cleanString(chunk.model_version) || cleanString(chunk.model) || model;
-    if (
-      (chunk.usageMetadata && typeof chunk.usageMetadata === 'object')
-      || (chunk.usage_metadata && typeof chunk.usage_metadata === 'object')
-    ) {
-      lastWithUsage = chunk;
+    providerRequestId = cleanString(recordField(record, 'responseId', 'response_id', 'id', 'name')) || providerRequestId;
+    model = cleanString(recordField(record, 'modelVersion', 'model_version', 'model')) || model;
+    if (nestedRecord(record, 'usageMetadata', 'usage_metadata')) {
+      lastWithUsage = record;
     }
   }
   if (!lastWithUsage) {
@@ -1914,31 +2450,26 @@ export function extractGeminiStreamUsage(chunks: Array<Record<string, unknown>>)
   };
 }
 
-export function extractVertexStreamUsage(chunks: Array<Record<string, unknown>>): Partial<LLMUsageEvent> {
+export function extractVertexStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
   return {
     ...extractGeminiStreamUsage(chunks),
     provider: 'vertex_ai',
   };
 }
 
-export function extractBedrockUsage(response: Record<string, unknown>): Partial<LLMUsageEvent> {
-  const usage = response.usage && typeof response.usage === 'object'
-    ? response.usage as Record<string, unknown>
-    : {};
-  const metrics = response.metrics && typeof response.metrics === 'object'
-    ? response.metrics as Record<string, unknown>
-    : {};
-  const metadata = response.ResponseMetadata && typeof response.ResponseMetadata === 'object'
-    ? response.ResponseMetadata as Record<string, unknown>
-    : {};
+export function extractBedrockUsage(response: unknown): Partial<LLMUsageEvent> {
+  const record = coerceObjectRecord(response) || {};
+  const usage = nestedRecord(record, 'usage') || {};
+  const metrics = nestedRecord(record, 'metrics') || {};
+  const metadata = nestedRecord(record, 'ResponseMetadata') || {};
   return {
     provider: 'bedrock',
-    providerRequestId: cleanString(response.requestId) || cleanString(response.request_id) || cleanString(metadata.RequestId),
-    model: cleanString(response.modelId) || cleanString(response.model_id) || cleanString(response.model),
-    inputTokens: cleanNumber(usage.inputTokens ?? usage.input_tokens),
-    outputTokens: cleanNumber(usage.outputTokens ?? usage.output_tokens),
-    totalTokens: cleanNumber(usage.totalTokens ?? usage.total_tokens),
-    latencyMs: cleanNumber(metrics.latencyMs ?? metrics.latency_ms),
+    providerRequestId: cleanString(recordField(record, 'requestId', 'request_id')) || cleanString(recordField(metadata, 'RequestId')),
+    model: cleanString(recordField(record, 'modelId', 'model_id', 'model')),
+    inputTokens: cleanNumber(recordField(usage, 'inputTokens', 'input_tokens')),
+    outputTokens: cleanNumber(recordField(usage, 'outputTokens', 'output_tokens')),
+    totalTokens: cleanNumber(recordField(usage, 'totalTokens', 'total_tokens')),
+    latencyMs: cleanNumber(recordField(metrics, 'latencyMs', 'latency_ms')),
   };
 }
 
@@ -1947,7 +2478,7 @@ export function extractBedrockUsage(response: Record<string, unknown>): Partial<
  * token increments, unlike Gemini/Vertex streams where usage is cumulative in
  * the final metadata chunk.
  */
-export function extractBedrockStreamUsage(chunks: Array<Record<string, unknown>>): Partial<LLMUsageEvent> {
+export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
   let providerRequestId: string | undefined;
   let model: string | undefined;
   let inputTokens = 0;
@@ -1955,18 +2486,19 @@ export function extractBedrockStreamUsage(chunks: Array<Record<string, unknown>>
   let totalTokens: number | undefined;
   let sawUsage = false;
   for (const chunk of chunks) {
-    if (!chunk || typeof chunk !== 'object') {
+    const record = coerceObjectRecord(chunk);
+    if (!record) {
       continue;
     }
-    providerRequestId = cleanString(chunk.requestId) || cleanString(chunk.request_id) || providerRequestId;
-    model = cleanString(chunk.modelId) || cleanString(chunk.model_id) || cleanString(chunk.model) || model;
-    const usage = chunk.usage && typeof chunk.usage === 'object' ? chunk.usage as Record<string, unknown> : undefined;
+    providerRequestId = cleanString(recordField(record, 'requestId', 'request_id')) || providerRequestId;
+    model = cleanString(recordField(record, 'modelId', 'model_id', 'model')) || model;
+    const usage = nestedRecord(record, 'usage');
     if (!usage) {
       continue;
     }
-    const input = cleanNumber(usage.inputTokens ?? usage.input_tokens);
-    const output = cleanNumber(usage.outputTokens ?? usage.output_tokens);
-    const total = cleanNumber(usage.totalTokens ?? usage.total_tokens);
+    const input = cleanNumber(recordField(usage, 'inputTokens', 'input_tokens'));
+    const output = cleanNumber(recordField(usage, 'outputTokens', 'output_tokens'));
+    const total = cleanNumber(recordField(usage, 'totalTokens', 'total_tokens'));
     if (input !== undefined) {
       inputTokens += input;
       sawUsage = true;
@@ -1985,6 +2517,82 @@ export function extractBedrockStreamUsage(chunks: Array<Record<string, unknown>>
     outputTokens: sawUsage ? outputTokens : undefined,
     totalTokens: totalTokens ?? (sawUsage ? inputTokens + outputTokens : undefined),
   };
+}
+
+export const PROVIDER_USAGE_EXTRACTORS: ReadonlyArray<Readonly<ProviderUsageExtractorDescriptor>> = Object.freeze([
+  Object.freeze({
+    provider: 'openai',
+    aliases: Object.freeze(['openai']),
+    responseExtractor: extractOpenAIUsage,
+    streamExtractor: extractOpenAIStreamUsage,
+  }),
+  Object.freeze({
+    provider: 'azure_openai',
+    aliases: Object.freeze(['azure_openai', 'azure-openai', 'azure']),
+    responseExtractor: extractAzureOpenAIUsage,
+    streamExtractor: (chunks: unknown[]) => ({
+      ...extractOpenAIStreamUsage(chunks),
+      provider: 'azure_openai',
+    }),
+  }),
+  Object.freeze({
+    provider: 'anthropic',
+    aliases: Object.freeze(['anthropic']),
+    responseExtractor: extractAnthropicUsage,
+    streamExtractor: extractAnthropicStreamUsage,
+  }),
+  Object.freeze({
+    provider: 'gemini',
+    aliases: Object.freeze(['gemini']),
+    responseExtractor: extractGeminiUsage,
+    streamExtractor: extractGeminiStreamUsage,
+  }),
+  Object.freeze({
+    provider: 'vertex_ai',
+    aliases: Object.freeze(['vertex_ai', 'vertex-ai', 'vertex']),
+    responseExtractor: extractVertexUsage,
+    streamExtractor: extractVertexStreamUsage,
+  }),
+  Object.freeze({
+    provider: 'bedrock',
+    aliases: Object.freeze(['bedrock']),
+    responseExtractor: extractBedrockUsage,
+    streamExtractor: extractBedrockStreamUsage,
+  }),
+]);
+
+export const PROVIDER_SUPPORT_MATRIX: ReadonlyArray<Readonly<ProviderSupportMatrixEntry>> = Object.freeze(
+  PROVIDER_USAGE_EXTRACTORS.map((descriptor) => Object.freeze({
+    provider: descriptor.provider,
+    aliases: descriptor.aliases.slice(),
+    response: true,
+    stream: Boolean(descriptor.streamExtractor),
+  })),
+);
+
+function findProviderUsageExtractor(provider?: string): ProviderUsageExtractorDescriptor | undefined {
+  const normalized = cleanString(provider)?.toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  return PROVIDER_USAGE_EXTRACTORS.find((descriptor) => descriptor.aliases.includes(normalized));
+}
+
+export function getProviderUsageExtractor(provider?: string): LLMUsageExtractor<unknown> | undefined {
+  return findProviderUsageExtractor(provider)?.responseExtractor;
+}
+
+export function getProviderStreamUsageExtractor(provider?: string): LLMUsageExtractor<unknown[]> | undefined {
+  return findProviderUsageExtractor(provider)?.streamExtractor;
+}
+
+export function listSupportedProviders(): ProviderSupportMatrixEntry[] {
+  return PROVIDER_SUPPORT_MATRIX.map((descriptor) => ({
+    provider: descriptor.provider,
+    aliases: descriptor.aliases.slice(),
+    response: descriptor.response,
+    stream: descriptor.stream,
+  }));
 }
 
 function normalizeOpenAICompatibleProvider(provider?: string): 'openai' | 'azure_openai' {
