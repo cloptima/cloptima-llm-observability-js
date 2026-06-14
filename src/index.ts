@@ -1,4 +1,4 @@
-const PACKAGE_VERSION = '0.1.4';
+const PACKAGE_VERSION = '0.2.0';
 export type CloptimaFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http';
 export type LLMUsageExtractor<T = unknown> = (input: T) => Partial<LLMUsageEvent>;
@@ -822,6 +822,160 @@ function cleanUsageMap(value: unknown): Record<string, number> | undefined {
   return Object.keys(result).length ? result : undefined;
 }
 
+function coerceRecordList(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const records: Array<Record<string, unknown>> = [];
+  for (const item of value) {
+    const record = coerceObjectRecord(item);
+    if (record) {
+      records.push(record);
+    }
+  }
+  return records;
+}
+
+function runtimePositiveUsageUnit(value: unknown, ...keys: string[]): number | undefined {
+  return cleanNumber(recordField(coerceObjectRecord(value), ...keys));
+}
+
+function detailModalityTokenCount(value: unknown, modality: 'image' | 'audio' | 'video'): number | undefined {
+  const direct = runtimePositiveUsageUnit(
+    value,
+    `${modality}_tokens`,
+    `${modality}_token_count`,
+    `${modality}TokenCount`,
+  );
+  if (direct !== undefined) {
+    return direct;
+  }
+  let total = 0;
+  let sawMatch = false;
+  for (const entry of coerceRecordList(value)) {
+    const entryModality = cleanString(recordField(entry, 'modality', 'type', 'kind'))?.toLowerCase();
+    if (entryModality !== modality) {
+      continue;
+    }
+    const count = cleanNumber(recordField(entry, 'tokenCount', 'token_count', 'tokens', 'count'));
+    if (count === undefined) {
+      continue;
+    }
+    total += count;
+    sawMatch = true;
+  }
+  return sawMatch ? total : undefined;
+}
+
+function accumulateStreamingCounter(
+  total: number | undefined,
+  lastSeen: number | undefined,
+  nextValue: number | undefined,
+): { total: number | undefined; lastSeen: number | undefined } {
+  if (nextValue === undefined) {
+    return { total, lastSeen };
+  }
+  if (lastSeen === undefined || total === undefined) {
+    return { total: nextValue, lastSeen: nextValue };
+  }
+  if (nextValue >= lastSeen) {
+    return { total: total + (nextValue - lastSeen), lastSeen: nextValue };
+  }
+  return { total: total + nextValue, lastSeen: nextValue };
+}
+
+function accumulateStreamingUsageMap(
+  totals: Record<string, number>,
+  lastSeen: Record<string, number>,
+  chunk: Record<string, number> | undefined,
+): void {
+  if (!chunk) {
+    return;
+  }
+  for (const [key, value] of Object.entries(chunk)) {
+    const previous = lastSeen[key];
+    if (previous === undefined) {
+      totals[key] = (totals[key] || 0) + value;
+    } else if (value >= previous) {
+      totals[key] = (totals[key] || 0) + (value - previous);
+    } else {
+      totals[key] = (totals[key] || 0) + value;
+    }
+    lastSeen[key] = value;
+  }
+}
+
+function extractRuntimeExtraUsageUnits(
+  usage: Record<string, unknown> | undefined,
+  promptDetails?: unknown,
+  completionDetails?: unknown,
+): Record<string, number> | undefined {
+  return cleanUsageMap({
+    cache_write: runtimePositiveUsageUnit(usage, 'cache_creation_input_tokens', 'cache_write_input_tokens')
+      || runtimePositiveUsageUnit(promptDetails, 'cache_creation_input_tokens', 'cache_write_input_tokens'),
+    cache_write_5m: runtimePositiveUsageUnit(usage, 'cache_creation_input_tokens_5m', 'cache_write_input_tokens_5m')
+      || runtimePositiveUsageUnit(promptDetails, 'cache_creation_input_tokens_5m', 'cache_write_input_tokens_5m'),
+    cache_write_1h: runtimePositiveUsageUnit(usage, 'cache_creation_input_tokens_1h', 'cache_write_input_tokens_1h')
+      || runtimePositiveUsageUnit(promptDetails, 'cache_creation_input_tokens_1h', 'cache_write_input_tokens_1h'),
+    input_image: runtimePositiveUsageUnit(
+      usage,
+      'input_image_tokens',
+      'image_input_tokens',
+      'inputImageTokens',
+      'imageInputTokens',
+      'inputImageTokenCount',
+      'input_image_token_count',
+    ) || detailModalityTokenCount(promptDetails, 'image'),
+    output_image: runtimePositiveUsageUnit(
+      usage,
+      'output_image_tokens',
+      'image_output_tokens',
+      'outputImageTokens',
+      'imageOutputTokens',
+      'outputImageTokenCount',
+      'output_image_token_count',
+    ) || detailModalityTokenCount(completionDetails, 'image'),
+    input_audio: runtimePositiveUsageUnit(
+      usage,
+      'input_audio_tokens',
+      'audio_input_tokens',
+      'inputAudioTokens',
+      'audioInputTokens',
+      'inputAudioTokenCount',
+      'input_audio_token_count',
+    ) || detailModalityTokenCount(promptDetails, 'audio'),
+    output_audio: runtimePositiveUsageUnit(
+      usage,
+      'output_audio_tokens',
+      'audio_output_tokens',
+      'outputAudioTokens',
+      'audioOutputTokens',
+      'outputAudioTokenCount',
+      'output_audio_token_count',
+    ) || detailModalityTokenCount(completionDetails, 'audio'),
+    input_video: runtimePositiveUsageUnit(
+      usage,
+      'input_video_tokens',
+      'video_input_tokens',
+      'inputVideoTokens',
+      'videoInputTokens',
+      'inputVideoTokenCount',
+      'input_video_token_count',
+    ) || detailModalityTokenCount(promptDetails, 'video'),
+    output_video: runtimePositiveUsageUnit(
+      usage,
+      'output_video_tokens',
+      'video_output_tokens',
+      'outputVideoTokens',
+      'videoOutputTokens',
+      'outputVideoTokenCount',
+      'output_video_token_count',
+    ) || detailModalityTokenCount(completionDetails, 'video'),
+    search_request: runtimePositiveUsageUnit(usage, 'search_requests', 'web_search_requests', 'searchRequests', 'webSearchRequests'),
+    request: runtimePositiveUsageUnit(usage, 'requests', 'request_count', 'requestCount'),
+  });
+}
+
 function hasMeaningfulExtraction(extracted: Partial<LLMUsageEvent>): boolean {
   return Boolean(
     extracted.provider
@@ -1166,8 +1320,39 @@ function resolveDeliveryMode(mode?: string): InternalLLMObservabilityDeliveryMod
   return mode === 'otlp_http' ? mode : 'cloptima_http';
 }
 
+function isLocalApiBaseUrl(value: string): boolean {
+  return /^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/|$)/i.test(value);
+}
+
+function withDefaultApiBaseScheme(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return DEFAULT_API_BASE_URL;
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  if (trimmed.startsWith('//')) {
+    return `https:${trimmed}`;
+  }
+  return `${isLocalApiBaseUrl(trimmed) ? 'http://' : 'https://'}${trimmed}`;
+}
+
 function resolveApiBaseUrl(apiBaseUrl?: string): string {
-  return (cleanString(apiBaseUrl) || DEFAULT_API_BASE_URL).replace(/\/+$/, '');
+  const candidate = withDefaultApiBaseScheme(cleanString(apiBaseUrl) || DEFAULT_API_BASE_URL);
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error(`Invalid Cloptima API base URL: ${apiBaseUrl}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`Cloptima API base URL must use http or https: ${apiBaseUrl}`);
+  }
+  if ((parsed.pathname && parsed.pathname !== '/') || parsed.search || parsed.hash) {
+    throw new Error(`Cloptima API base URL must not include a path, query, or hash: ${apiBaseUrl}`);
+  }
+  return parsed.origin.replace(/\/+$/, '');
 }
 
 function resolveIngestUrl(apiBaseUrl: string): string {
@@ -2204,15 +2389,20 @@ export function initFromEnv(
     ...clientOptions
   } = options || {};
 
-  return new CloptimaLLMObservability({
-    ...clientOptions,
-    apiBaseUrl: apiBaseUrl || '',
-    apiKey: apiKey || '',
-    defaultAttribution: defaultAttribution as LLMAttribution,
-    deliveryMode: options?.deliveryMode || cleanString(env[INIT_DELIVERY_MODE_ENV]) as LLMObservabilityDeliveryMode | undefined,
-    otlpServiceName: options?.otlpServiceName || cleanString(env[INIT_OTLP_SERVICE_NAME_ENV]),
-    otlpServiceVersion: options?.otlpServiceVersion || cleanString(env[INIT_OTLP_SERVICE_VERSION_ENV]),
-  });
+  try {
+    return new CloptimaLLMObservability({
+      ...clientOptions,
+      apiBaseUrl: apiBaseUrl || '',
+      apiKey: apiKey || '',
+      defaultAttribution: defaultAttribution as LLMAttribution,
+      deliveryMode: options?.deliveryMode || cleanString(env[INIT_DELIVERY_MODE_ENV]) as LLMObservabilityDeliveryMode | undefined,
+      otlpServiceName: options?.otlpServiceName || cleanString(env[INIT_OTLP_SERVICE_NAME_ENV]),
+      otlpServiceVersion: options?.otlpServiceVersion || cleanString(env[INIT_OTLP_SERVICE_VERSION_ENV]),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to initialize Cloptima LLM observability';
+    return disabledClient(initError(options, message));
+  }
 }
 
 export function createObservedCall<T>(
@@ -2303,11 +2493,7 @@ export function extractOpenAIUsage(response: unknown): Partial<LLMUsageEvent> {
     totalTokens: cleanNumber(usage.total_tokens),
     reasoningTokens: cleanNumber(completionDetails.reasoning_tokens),
     cachedInputTokens: cleanNumber(promptDetails.cached_tokens),
-    extraUsageUnits: cleanUsageMap({
-      cache_write: promptDetails.cache_creation_input_tokens,
-      cache_write_5m: promptDetails.cache_creation_input_tokens_5m,
-      cache_write_1h: promptDetails.cache_creation_input_tokens_1h,
-    }),
+    extraUsageUnits: extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails),
     cacheHit: cleanNumber(promptDetails.cached_tokens) ? true : undefined,
   };
 }
@@ -2365,9 +2551,7 @@ export function extractAnthropicUsage(response: unknown): Partial<LLMUsageEvent>
     ),
     cachedInputTokens,
     extraUsageUnits: cleanUsageMap({
-      cache_write: usage.cache_creation_input_tokens,
-      cache_write_5m: usage.cache_creation_input_tokens_5m,
-      cache_write_1h: usage.cache_creation_input_tokens_1h,
+      ...extractRuntimeExtraUsageUnits(usage),
       server_tool_use: usage.server_tool_use,
     }),
     cacheHit: cachedInputTokens ? true : undefined,
@@ -2380,7 +2564,11 @@ export function extractAnthropicStreamUsage(chunks: Array<unknown>): Partial<LLM
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
   let cachedInputTokens: number | undefined;
-  let cacheWriteTokens: number | undefined;
+  let lastInputTokens: number | undefined;
+  let lastOutputTokens: number | undefined;
+  let lastCachedInputTokens: number | undefined;
+  const extraUsageUnits: Record<string, number> = {};
+  const lastExtraUsageUnits: Record<string, number> = {};
   for (const chunk of chunks) {
     const record = coerceObjectRecord(chunk);
     if (!record) {
@@ -2395,10 +2583,22 @@ export function extractAnthropicStreamUsage(chunks: Array<unknown>): Partial<LLM
     } else {
       usage = nestedRecord(record, 'usage') || {};
     }
-    inputTokens = cleanNumber(usage.input_tokens) ?? inputTokens;
-    outputTokens = cleanNumber(usage.output_tokens) ?? outputTokens;
-    cachedInputTokens = cleanNumber(usage.cache_read_input_tokens) ?? cachedInputTokens;
-    cacheWriteTokens = cleanNumber(usage.cache_creation_input_tokens) ?? cacheWriteTokens;
+    ({ total: inputTokens, lastSeen: lastInputTokens } = accumulateStreamingCounter(
+      inputTokens,
+      lastInputTokens,
+      cleanNumber(usage.input_tokens),
+    ));
+    ({ total: outputTokens, lastSeen: lastOutputTokens } = accumulateStreamingCounter(
+      outputTokens,
+      lastOutputTokens,
+      cleanNumber(usage.output_tokens),
+    ));
+    ({ total: cachedInputTokens, lastSeen: lastCachedInputTokens } = accumulateStreamingCounter(
+      cachedInputTokens,
+      lastCachedInputTokens,
+      cleanNumber(usage.cache_read_input_tokens),
+    ));
+    accumulateStreamingUsageMap(extraUsageUnits, lastExtraUsageUnits, extractRuntimeExtraUsageUnits(usage));
   }
   const totalTokens = inputTokens !== undefined || outputTokens !== undefined ? (inputTokens || 0) + (outputTokens || 0) : undefined;
   return {
@@ -2409,7 +2609,7 @@ export function extractAnthropicStreamUsage(chunks: Array<unknown>): Partial<LLM
     outputTokens,
     totalTokens,
     cachedInputTokens,
-    extraUsageUnits: cleanUsageMap({ cache_write: cacheWriteTokens }),
+    extraUsageUnits: Object.keys(extraUsageUnits).length ? extraUsageUnits : undefined,
     cacheHit: cachedInputTokens ? true : undefined,
   };
 }
@@ -2417,6 +2617,8 @@ export function extractAnthropicStreamUsage(chunks: Array<unknown>): Partial<LLM
 export function extractGeminiUsage(response: unknown): Partial<LLMUsageEvent> {
   const record = coerceObjectRecord(response) || {};
   const usage = nestedRecord(record, 'usageMetadata', 'usage_metadata') || {};
+  const promptDetails = recordField(usage, 'promptTokensDetails', 'prompt_tokens_details', 'inputTokensDetails', 'input_tokens_details');
+  const completionDetails = recordField(usage, 'candidatesTokensDetails', 'candidates_tokens_details', 'responseTokensDetails', 'response_tokens_details', 'outputTokensDetails', 'output_tokens_details');
   const cachedInputTokens = cleanNumber(recordField(usage, 'cachedContentTokenCount', 'cached_content_token_count'));
   return {
     provider: cleanString(recordField(record, 'provider')) || 'gemini',
@@ -2427,6 +2629,7 @@ export function extractGeminiUsage(response: unknown): Partial<LLMUsageEvent> {
     totalTokens: cleanNumber(recordField(usage, 'totalTokenCount', 'total_token_count')),
     reasoningTokens: cleanNumber(recordField(usage, 'thoughtsTokenCount', 'thoughts_token_count', 'reasoningTokenCount', 'reasoning_token_count')),
     cachedInputTokens,
+    extraUsageUnits: extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails),
     cacheHit: cachedInputTokens ? true : undefined,
   };
 }
@@ -2476,6 +2679,8 @@ export function extractBedrockUsage(response: unknown): Partial<LLMUsageEvent> {
   const usage = nestedRecord(record, 'usage') || {};
   const metrics = nestedRecord(record, 'metrics') || {};
   const metadata = nestedRecord(record, 'ResponseMetadata') || {};
+  const promptDetails = recordField(usage, 'promptTokensDetails', 'prompt_tokens_details', 'inputTokensDetails', 'input_tokens_details');
+  const completionDetails = recordField(usage, 'completionTokensDetails', 'completion_tokens_details', 'outputTokensDetails', 'output_tokens_details');
   return {
     provider: 'bedrock',
     providerRequestId: cleanString(recordField(record, 'requestId', 'request_id')) || cleanString(recordField(metadata, 'RequestId')),
@@ -2483,6 +2688,7 @@ export function extractBedrockUsage(response: unknown): Partial<LLMUsageEvent> {
     inputTokens: cleanNumber(recordField(usage, 'inputTokens', 'input_tokens')),
     outputTokens: cleanNumber(recordField(usage, 'outputTokens', 'output_tokens')),
     totalTokens: cleanNumber(recordField(usage, 'totalTokens', 'total_tokens')),
+    extraUsageUnits: extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails),
     latencyMs: cleanNumber(recordField(metrics, 'latencyMs', 'latency_ms')),
   };
 }
@@ -2495,9 +2701,13 @@ export function extractBedrockUsage(response: unknown): Partial<LLMUsageEvent> {
 export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
   let providerRequestId: string | undefined;
   let model: string | undefined;
-  let inputTokens = 0;
-  let outputTokens = 0;
+  let inputTokens: number | undefined;
+  let outputTokens: number | undefined;
+  let lastInputTokens: number | undefined;
+  let lastOutputTokens: number | undefined;
   let totalTokens: number | undefined;
+  const extraUsageUnits: Record<string, number> = {};
+  const lastExtraUsageUnits: Record<string, number> = {};
   let sawUsage = false;
   for (const chunk of chunks) {
     const record = coerceObjectRecord(chunk);
@@ -2513,14 +2723,19 @@ export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUs
     const input = cleanNumber(recordField(usage, 'inputTokens', 'input_tokens'));
     const output = cleanNumber(recordField(usage, 'outputTokens', 'output_tokens'));
     const total = cleanNumber(recordField(usage, 'totalTokens', 'total_tokens'));
-    if (input !== undefined) {
-      inputTokens += input;
+    const promptDetails = recordField(usage, 'promptTokensDetails', 'prompt_tokens_details', 'inputTokensDetails', 'input_tokens_details');
+    const completionDetails = recordField(usage, 'completionTokensDetails', 'completion_tokens_details', 'outputTokensDetails', 'output_tokens_details');
+    const chunkExtraUsageUnits = extractRuntimeExtraUsageUnits(
+      usage,
+      promptDetails,
+      completionDetails,
+    ) || {};
+    ({ total: inputTokens, lastSeen: lastInputTokens } = accumulateStreamingCounter(inputTokens, lastInputTokens, input));
+    ({ total: outputTokens, lastSeen: lastOutputTokens } = accumulateStreamingCounter(outputTokens, lastOutputTokens, output));
+    if (input !== undefined || output !== undefined || Object.keys(chunkExtraUsageUnits).length > 0) {
       sawUsage = true;
     }
-    if (output !== undefined) {
-      outputTokens += output;
-      sawUsage = true;
-    }
+    accumulateStreamingUsageMap(extraUsageUnits, lastExtraUsageUnits, chunkExtraUsageUnits);
     totalTokens = total ?? totalTokens;
   }
   return {
@@ -2529,7 +2744,8 @@ export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUs
     model,
     inputTokens: sawUsage ? inputTokens : undefined,
     outputTokens: sawUsage ? outputTokens : undefined,
-    totalTokens: totalTokens ?? (sawUsage ? inputTokens + outputTokens : undefined),
+    totalTokens: totalTokens ?? (sawUsage ? (inputTokens || 0) + (outputTokens || 0) : undefined),
+    extraUsageUnits: Object.keys(extraUsageUnits).length ? extraUsageUnits : undefined,
   };
 }
 

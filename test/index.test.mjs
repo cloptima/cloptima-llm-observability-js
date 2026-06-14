@@ -190,6 +190,28 @@ test('initFromEnv uses default ingest URL and production environment when omitte
   assert.equal(body.metadata.environment, 'production');
 });
 
+test('initFromEnv normalizes scheme-less and trailing-slash api base URLs', async () => {
+  let observedInput;
+  const client = initFromEnv({
+    env: {
+      CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
+      CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
+      CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL: 'sdk-ingest.example.cloptima.ai/',
+    },
+    fetchImpl: async (input) => {
+      observedInput = String(input);
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  await client.record({
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+  });
+
+  assert.equal(observedInput, TEST_INGEST_URL);
+});
+
 test('isEnabled requires api key and app id only', () => {
   assert.equal(isEnabled({
     env: {
@@ -230,6 +252,47 @@ test('direct constructor derives the default OTLP URL from the default ingest UR
   });
 
   assert.deepEqual(observed, [DEFAULT_OTLP_URL]);
+});
+
+test('direct constructor infers http for scheme-less localhost api base URLs', async () => {
+  let observedInput;
+  let observedHeaders;
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: '127.0.0.1:4318/',
+    apiKey: 'pat-env',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'production',
+    },
+    deliveryMode: 'otlp_http',
+    fetchImpl: async (input, init) => {
+      observedInput = String(input);
+      observedHeaders = Object.fromEntries(new Headers(init?.headers).entries());
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  await client.record({
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+  });
+
+  assert.equal(observedInput, 'http://127.0.0.1:4318/v1/ai/integrations/otlp/traces');
+  assert.equal(observedHeaders.authorization, undefined);
+});
+
+test('initFromEnv stays fail-open but diagnosable when api base URL is invalid', () => {
+  const client = initFromEnv({
+    env: {
+      CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
+      CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
+      CLOPTIMA_LLM_OBSERVABILITY_API_BASE_URL: 'https://api.cloptima.ai/custom-path',
+    },
+    enabled: true,
+  });
+
+  assert.equal(client.isEnabled(), false);
+  assert.match(String(client.getInitError()?.message || ''), /must not include a path, query, or hash/);
 });
 
 test('direct constructor rejects the dormant dual delivery mode', () => {
@@ -658,17 +721,18 @@ test('record strict_finops mode keeps only finance-safe custom metadata keys', a
   assert.equal(body.metadata.prompt, undefined);
 });
 
-test('initFromEnv rejects the dormant dual delivery mode', () => {
-  assert.throws(
-    () => initFromEnv({
-      env: {
-        CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
-        CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
-        CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE: 'dual',
-      },
-    }),
-    /temporarily disabled/,
-  );
+test('initFromEnv stays fail-open but diagnosable when dual delivery mode is requested', () => {
+  const client = initFromEnv({
+    env: {
+      CLOPTIMA_LLM_OBSERVABILITY_API_KEY: 'pat-env',
+      CLOPTIMA_LLM_OBSERVABILITY_APP_ID: 'agent-api',
+      CLOPTIMA_LLM_OBSERVABILITY_DELIVERY_MODE: 'dual',
+    },
+    enabled: true,
+  });
+
+  assert.equal(client.isEnabled(), false);
+  assert.match(String(client.getInitError()?.message || ''), /temporarily disabled/);
 });
 
 test('recordAsync uses bounded queue, batches events, retries, and flushes', async () => {
@@ -817,6 +881,46 @@ test('observe records successful calls with extracted OpenAI usage', async () =>
   assert.equal(body?.metadata?.tool_name, 'profile_lookup');
   assert.equal(body?.metadata?.retry_index, 1);
   assert.equal(body?.metadata?.loop_iteration, 2);
+});
+
+test('observe preserves vendorReportedCostUsd from a custom extractor', async () => {
+  let body;
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+    },
+    fetchImpl: async (_input, init) => {
+      body = JSON.parse(String(init?.body));
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  const extractor = createMappedUsageExtractor({
+    defaults: { provider: 'vertex_ai' },
+    fields: {
+      providerRequestId: 'response.id',
+      model: 'response.model',
+      vendorReportedCostUsd: 'billing.cost_usd',
+    },
+  });
+
+  await client.observe({
+    provider: 'vertex_ai',
+    model: 'gemini-2.5-pro',
+    fireAndForget: false,
+    call: async () => ({
+      response: { id: 'resp-cost-1', model: 'gemini-2.5-pro' },
+      billing: { cost_usd: '0.4321' },
+    }),
+    extractUsage: extractor,
+  });
+
+  assert.equal(body?.provider, 'vertex_ai');
+  assert.equal(body?.provider_request_id, 'resp-cost-1');
+  assert.equal(body?.vendor_reported_cost_usd, 0.4321);
 });
 
 test('observeCall accepts flat attribution fields and per-call metadata privacy overrides', async () => {
@@ -1921,6 +2025,7 @@ test('cloud provider stream extractors normalize usage', () => {
       totalTokens: 18,
       reasoningTokens: undefined,
       cachedInputTokens: undefined,
+      extraUsageUnits: undefined,
       cacheHit: undefined,
     },
   );
@@ -1943,6 +2048,7 @@ test('cloud provider stream extractors normalize usage', () => {
       inputTokens: 5,
       outputTokens: 9,
       totalTokens: 14,
+      extraUsageUnits: undefined,
     },
   );
 });
@@ -1955,7 +2061,7 @@ test('extractAnthropicStreamUsage aggregates message stream events', () => {
         message: {
           id: 'msg-stream',
           model: 'claude-3-5-sonnet',
-          usage: { input_tokens: 8, cache_read_input_tokens: 2 },
+          usage: { input_tokens: 8, cache_read_input_tokens: 2, input_audio_tokens: 5 },
         },
       },
       { type: 'message_delta', usage: { output_tokens: 4, cache_creation_input_tokens: 3 } },
@@ -1968,8 +2074,65 @@ test('extractAnthropicStreamUsage aggregates message stream events', () => {
       outputTokens: 4,
       totalTokens: 12,
       cachedInputTokens: 2,
-      extraUsageUnits: { cache_write: 3 },
+      extraUsageUnits: { cache_write: 3, input_audio: 5 },
       cacheHit: true,
+    },
+  );
+});
+
+test('stream usage aggregators tolerate cumulative chunk counters', () => {
+  assert.deepEqual(
+    extractAnthropicStreamUsage([
+      {
+        type: 'message_start',
+        message: {
+          id: 'msg-stream-cumulative',
+          model: 'claude-3-5-sonnet',
+          usage: { input_tokens: 8, input_audio_tokens: 2 },
+        },
+      },
+      {
+        type: 'message_delta',
+        usage: { output_tokens: 2, cache_creation_input_tokens: 1, input_audio_tokens: 2 },
+      },
+      {
+        type: 'message_delta',
+        usage: { output_tokens: 4, cache_creation_input_tokens: 3, input_audio_tokens: 5 },
+      },
+    ]),
+    {
+      provider: 'anthropic',
+      providerRequestId: 'msg-stream-cumulative',
+      model: 'claude-3-5-sonnet',
+      inputTokens: 8,
+      outputTokens: 4,
+      totalTokens: 12,
+      cachedInputTokens: undefined,
+      extraUsageUnits: { cache_write: 3, input_audio: 5 },
+      cacheHit: undefined,
+    },
+  );
+  assert.deepEqual(
+    extractBedrockStreamUsage([
+      {
+        requestId: 'bedrock-stream-cumulative',
+        modelId: 'anthropic.claude-3-5-sonnet',
+        usage: { inputTokens: 5, outputTokens: 1, totalTokens: 6, outputVideoTokens: 1 },
+      },
+      {
+        requestId: 'bedrock-stream-cumulative',
+        modelId: 'anthropic.claude-3-5-sonnet',
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8, outputVideoTokens: 2 },
+      },
+    ]),
+    {
+      provider: 'bedrock',
+      providerRequestId: 'bedrock-stream-cumulative',
+      model: 'anthropic.claude-3-5-sonnet',
+      inputTokens: 5,
+      outputTokens: 3,
+      totalTokens: 8,
+      extraUsageUnits: { output_video: 2 },
     },
   );
 });
@@ -1984,6 +2147,7 @@ test('provider usage extractors normalize common response shapes', () => {
         output_tokens: 5,
         cache_read_input_tokens: 3,
         cache_creation_input_tokens: 7,
+        input_audio_tokens: 4,
       },
     }),
     {
@@ -1994,7 +2158,7 @@ test('provider usage extractors normalize common response shapes', () => {
       outputTokens: 5,
       totalTokens: 15,
       cachedInputTokens: 3,
-      extraUsageUnits: { cache_write: 7 },
+      extraUsageUnits: { cache_write: 7, input_audio: 4 },
       cacheHit: true,
     },
   );
@@ -2008,6 +2172,13 @@ test('provider usage extractors normalize common response shapes', () => {
         totalTokenCount: 24,
         thoughtsTokenCount: 2,
         cachedContentTokenCount: 4,
+        promptTokensDetails: {
+          audioTokenCount: 5,
+          imageTokenCount: 3,
+        },
+        candidatesTokensDetails: {
+          videoTokenCount: 2,
+        },
       },
     }),
     {
@@ -2019,7 +2190,46 @@ test('provider usage extractors normalize common response shapes', () => {
       totalTokens: 24,
       reasoningTokens: 2,
       cachedInputTokens: 4,
+      extraUsageUnits: {
+        input_audio: 5,
+        input_image: 3,
+        output_video: 2,
+      },
       cacheHit: true,
+    },
+  );
+  assert.deepEqual(
+    extractGeminiUsage({
+      responseId: 'gemini-response-list-1',
+      modelVersion: 'gemini-2.5-flash',
+      usageMetadata: {
+        promptTokenCount: 11,
+        candidatesTokenCount: 13,
+        totalTokenCount: 24,
+        promptTokensDetails: [
+          { modality: 'AUDIO', tokenCount: 5 },
+          { modality: 'IMAGE', tokenCount: 3 },
+        ],
+        candidatesTokensDetails: [
+          { modality: 'VIDEO', tokenCount: 2 },
+        ],
+      },
+    }),
+    {
+      provider: 'gemini',
+      providerRequestId: 'gemini-response-list-1',
+      model: 'gemini-2.5-flash',
+      inputTokens: 11,
+      outputTokens: 13,
+      totalTokens: 24,
+      reasoningTokens: undefined,
+      cachedInputTokens: undefined,
+      extraUsageUnits: {
+        input_audio: 5,
+        input_image: 3,
+        output_video: 2,
+      },
+      cacheHit: undefined,
     },
   );
   assert.equal(
@@ -2037,7 +2247,13 @@ test('provider usage extractors normalize common response shapes', () => {
   assert.deepEqual(
     extractBedrockUsage({
       modelId: 'anthropic.claude-3-5-sonnet',
-      usage: { inputTokens: 20, outputTokens: 6, totalTokens: 26 },
+      usage: {
+        inputTokens: 20,
+        outputTokens: 6,
+        totalTokens: 26,
+        inputAudioTokens: 7,
+        completionTokensDetails: { imageTokenCount: 2 },
+      },
       metrics: { latencyMs: 321 },
       ResponseMetadata: { RequestId: 'bedrock-request-1' },
     }),
@@ -2048,6 +2264,7 @@ test('provider usage extractors normalize common response shapes', () => {
       inputTokens: 20,
       outputTokens: 6,
       totalTokens: 26,
+      extraUsageUnits: { input_audio: 7, output_image: 2 },
       latencyMs: 321,
     },
   );
@@ -2055,7 +2272,12 @@ test('provider usage extractors normalize common response shapes', () => {
     extractAzureOpenAIUsage({
       id: 'chatcmpl-azure',
       deployment_name: 'gpt-4o-mini-prod',
-      usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+      usage: {
+        prompt_tokens: 1,
+        completion_tokens: 2,
+        total_tokens: 3,
+        completion_tokens_details: { image_tokens: 4 },
+      },
     }),
     {
       providerRequestId: 'chatcmpl-azure',
@@ -2063,9 +2285,9 @@ test('provider usage extractors normalize common response shapes', () => {
       inputTokens: 1,
       outputTokens: 2,
       totalTokens: 3,
+      extraUsageUnits: { output_image: 4 },
       reasoningTokens: undefined,
       cachedInputTokens: undefined,
-      extraUsageUnits: undefined,
       cacheHit: undefined,
       provider: 'azure_openai',
     },

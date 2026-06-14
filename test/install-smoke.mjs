@@ -59,6 +59,8 @@ try {
   assert.ok(packedFiles.some((file) => file.endsWith('examples/basic.mjs')));
   assert.ok(packedFiles.some((file) => file.endsWith('examples/custom-wrapper.mjs')));
   assert.ok(packedFiles.some((file) => file.endsWith('examples/fetch-wrapper.mjs')));
+  assert.ok(packedFiles.some((file) => file.endsWith('examples/mapped-extractor.mjs')));
+  assert.ok(packedFiles.some((file) => file.endsWith('examples/multimodal-tokens.mjs')));
   assert.ok(!packedFiles.some((file) => file.startsWith('test/')));
 
   const freshProject = path.join(workDir, 'fresh-project');
