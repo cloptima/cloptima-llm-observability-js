@@ -1,18 +1,18 @@
 {
   "name": "@cloptima/llm-observability",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "LLM usage telemetry SDK for Cloptima reporting, attribution, and analytics",
   "license": "UNLICENSED",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
-  "homepage": "https://github.com/cloptima/cloptima-llm-observability-js#readme",
+  "homepage": "https://github.com/cloptima/llm-observability-js#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cloptima/cloptima-llm-observability-js.git"
+    "url": "git+https://github.com/cloptima/llm-observability-js.git"
   },
   "bugs": {
-    "url": "https://github.com/cloptima/cloptima-llm-observability-js/issues"
+    "url": "https://github.com/cloptima/llm-observability-js/issues"
   },
   "keywords": [
     "cloptima",

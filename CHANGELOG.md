@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1
+## 0.2.2
 
 - Improved delivery reliability so observed calls report submission issues more consistently while keeping application instrumentation lightweight.
 - Expanded OTLP-compatible telemetry to carry additional usage units for multimodal and other non-token billing signals.
