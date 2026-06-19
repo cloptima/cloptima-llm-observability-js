@@ -1416,6 +1416,21 @@ function otlpAttributeValue(value: unknown): Record<string, unknown> | undefined
   return undefined;
 }
 
+function otlpExtraUsageAttributes(payload: Record<string, unknown>): Array<[string, unknown]> {
+  const extraUsageUnits = cleanUsageMap(payload.extra_usage_units);
+  if (!extraUsageUnits) {
+    return [];
+  }
+  const attributes: Array<[string, unknown]> = [['extra_usage_units', extraUsageUnits]];
+  for (const key of Object.keys(extraUsageUnits).sort()) {
+    const value = cleanNumber(extraUsageUnits[key]);
+    if (key && typeof value === 'number' && value > 0) {
+      attributes.push([`gen_ai.usage.${key}`, value]);
+    }
+  }
+  return attributes;
+}
+
 function otlpAttributesFromPayload(payload: Record<string, unknown>): Array<Record<string, unknown>> {
   const metadata = payload.metadata && typeof payload.metadata === 'object'
     ? payload.metadata as Record<string, unknown>
@@ -1432,6 +1447,7 @@ function otlpAttributesFromPayload(payload: Record<string, unknown>): Array<Reco
     ['gen_ai.usage.total_tokens', cleanNumber(payload.total_tokens)],
     ['gen_ai.usage.reasoning_tokens', cleanNumber(payload.reasoning_tokens)],
     ['gen_ai.usage.cached_input_tokens', cleanNumber(payload.cached_input_tokens)],
+    ['extra_usage_units', cleanUsageMap(payload.extra_usage_units)],
     ['gen_ai.usage.cost', cleanDecimal(payload.vendor_reported_cost_usd)],
     ['cache_hit', cleanBoolean(payload.cache_hit)],
     ['cloptima.request_id', cleanString(payload.request_id)],
@@ -1463,6 +1479,7 @@ function otlpAttributesFromPayload(payload: Record<string, unknown>): Array<Reco
     ['sdk_name', cleanString(payload.sdk_name)],
     ['sdk_version', cleanString(payload.sdk_version)],
   ];
+  attributes.push(...otlpExtraUsageAttributes(payload));
   for (const [key, value] of Object.entries(metadata)) {
     if (attributes.some(([existing]) => existing === key)) {
       continue;
@@ -2079,6 +2096,30 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
     }
   }
 
+  private reportObserveError(error: unknown): void {
+    if (error instanceof Error) {
+      this.options.onError?.(error);
+      return;
+    }
+    this.options.onError?.(new Error(String(error)));
+  }
+
+  private async recordObservedEventSafely(
+    event: LLMUsageEvent,
+    metadataPrivacy?: MetadataPrivacyOptions,
+    fireAndForget?: boolean,
+  ): Promise<void> {
+    if (fireAndForget === false) {
+      try {
+        await this.postPayload(this.eventPayload(event, metadataPrivacy));
+      } catch (error) {
+        this.reportObserveError(error);
+      }
+      return;
+    }
+    this.recordAsyncWithPrivacy(event, metadataPrivacy);
+  }
+
   async observe<T>(options: ObserveLLMCallOptions<T>): Promise<T> {
     const startedAt = new Date();
     try {
@@ -2102,11 +2143,7 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
           ...(extracted.metadata || {}),
         },
       };
-      if (options.fireAndForget === false) {
-        await this.postPayload(this.eventPayload(event, options.metadataPrivacy));
-      } else {
-        this.recordAsyncWithPrivacy(event, options.metadataPrivacy);
-      }
+      await this.recordObservedEventSafely(event, options.metadataPrivacy, options.fireAndForget !== false);
       return response;
     } catch (error) {
       const completedAt = new Date();
@@ -2126,11 +2163,7 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
           ...(options.metadata || {}),
         },
       };
-      if (options.fireAndForget === false) {
-        await this.postPayload(this.eventPayload(event, options.metadataPrivacy));
-      } else {
-        this.recordAsyncWithPrivacy(event, options.metadataPrivacy);
-      }
+      await this.recordObservedEventSafely(event, options.metadataPrivacy, options.fireAndForget !== false);
       throw error;
     }
   }
@@ -2182,11 +2215,7 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
           streamed: true,
         },
       };
-      if (options.fireAndForget === true) {
-        this.recordAsyncWithPrivacy(event, options.metadataPrivacy);
-      } else {
-        await this.postPayload(this.eventPayload(event, options.metadataPrivacy));
-      }
+      await this.recordObservedEventSafely(event, options.metadataPrivacy, options.fireAndForget !== false);
     } catch (error) {
       const completedAt = new Date();
       const event: LLMUsageEvent = {
@@ -2207,11 +2236,7 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
           stream_chunks: emittedChunks,
         },
       };
-      if (options.fireAndForget === true) {
-        this.recordAsyncWithPrivacy(event, options.metadataPrivacy);
-      } else {
-        await this.postPayload(this.eventPayload(event, options.metadataPrivacy));
-      }
+      await this.recordObservedEventSafely(event, options.metadataPrivacy, options.fireAndForget !== false);
       throw error;
     }
   }

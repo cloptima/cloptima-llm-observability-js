@@ -491,6 +491,10 @@ test('preview helpers build sanitized payloads and OTLP dry-run requests', () =>
     provider: 'openai',
     model: 'gpt-4o-mini',
     requestId: 'req-preview-1',
+    extraUsageUnits: {
+      input_image: 3,
+      output_audio: 5,
+    },
     metadata: {
       route: '/chat',
       prompt: 'secret prompt',
@@ -522,6 +526,12 @@ test('preview helpers build sanitized payloads and OTLP dry-run requests', () =>
   assert.equal(payload.metadata.prompt, undefined);
   assert.equal(otlp.resourceSpans[0].resource.attributes[0].value.stringValue, 'agent-api');
   assert.equal(otlp.resourceSpans[0].scopeSpans[0].spans[0].name, 'llm.openai.gpt-4o-mini');
+  const otlpAttrs = Object.fromEntries(
+    otlp.resourceSpans[0].scopeSpans[0].spans[0].attributes.map((entry) => [entry.key, entry.value]),
+  );
+  assert.equal(otlpAttrs['gen_ai.usage.input_image'].intValue, 3);
+  assert.equal(otlpAttrs['gen_ai.usage.output_audio'].intValue, 5);
+  assert.equal(otlpAttrs.extra_usage_units.stringValue, JSON.stringify({ input_image: 3, output_audio: 5 }));
 
   const batchPayload = previewBatchPayload([
     { provider: 'openai', model: 'gpt-4o-mini', sourceEventId: 'evt-1' },
@@ -881,6 +891,33 @@ test('observe records successful calls with extracted OpenAI usage', async () =>
   assert.equal(body?.metadata?.tool_name, 'profile_lookup');
   assert.equal(body?.metadata?.retry_index, 1);
   assert.equal(body?.metadata?.loop_iteration, 2);
+});
+
+test('observe ignores telemetry-only delivery failures and reports them through onError', async () => {
+  const errors = [];
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+    },
+    onError: (error) => errors.push(error),
+    fetchImpl: async () => {
+      throw new Error('ingest unavailable');
+    },
+  });
+
+  const response = await client.observe({
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    fireAndForget: false,
+    call: async () => ({ id: 'chatcmpl-telemetry-1' }),
+  });
+
+  assert.equal(response.id, 'chatcmpl-telemetry-1');
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /ingest unavailable/);
 });
 
 test('observe preserves vendorReportedCostUsd from a custom extractor', async () => {
@@ -1803,6 +1840,41 @@ test('observeStream yields chunks and records final stream usage', async () => {
   assert.equal(body?.metadata?.streamed, true);
 });
 
+test('observeStream ignores telemetry-only delivery failures and reports them through onError', async () => {
+  const errors = [];
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+    },
+    onError: (error) => errors.push(error),
+    fetchImpl: async () => {
+      throw new Error('ingest unavailable');
+    },
+  });
+
+  async function* stream() {
+    yield 'chunk-1';
+    yield 'chunk-2';
+  }
+
+  const emitted = [];
+  for await (const chunk of client.observeStream({
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    fireAndForget: false,
+    call: stream,
+  })) {
+    emitted.push(chunk);
+  }
+
+  assert.deepEqual(emitted, ['chunk-1', 'chunk-2']);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /ingest unavailable/);
+});
+
 test('instrumentOpenAICompatibleStream observes an existing stream and yields original chunks', async () => {
   let body;
   const client = new CloptimaLLMObservability({
@@ -1928,7 +2000,7 @@ test('instrumentOpenAICompatibleStream preserves azure_openai provider attributi
   assert.equal(body?.provider, 'azure_openai');
 });
 
-test('observeStream defaults to synchronous recording and bounds extractor chunks', async () => {
+test('observeStream defaults to fire-and-forget recording and bounds extractor chunks', async () => {
   let body;
   const observedChunkLengths = [];
   const client = new CloptimaLLMObservability({
@@ -1967,6 +2039,7 @@ test('observeStream defaults to synchronous recording and bounds extractor chunk
   })) {
     emitted.push(chunk);
   }
+  assert.equal(await client.flush(2000), true);
 
   assert.equal(emitted.length, 3);
   assert.deepEqual(observedChunkLengths, [2]);

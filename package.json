@@ -1,8 +1,8 @@
 {
   "name": "@cloptima/llm-observability",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "LLM usage telemetry SDK for Cloptima reporting, attribution, and analytics",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "UNLICENSED",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Improved delivery reliability so observed calls report submission issues more consistently while keeping application instrumentation lightweight.
+- Expanded OTLP-compatible telemetry to carry additional usage units for multimodal and other non-token billing signals.
+
 ## 0.2.0
 
 - Added context-first attribution helpers so workflows and features can be set once and inherited across nested LLM calls.
